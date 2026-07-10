@@ -1,12 +1,12 @@
 # 日向坂46／櫻坂46 部落格圖片 Discord 通知器
 
-在 Windows 上以同一個 Discord Bot 並行輪詢日向坂46及櫻坂46官方部落格首頁，直接取得實際存在的文章 ID，將兩團的新文章圖片傳送至各自指定頻道。
+在 Windows 或 Raspberry Pi OS 上以同一個 Discord Bot 並行輪詢日向坂46及櫻坂46官方部落格首頁，直接取得實際存在的文章 ID，將兩團的新文章圖片傳送至各自指定頻道。本機圖片儲存可透過 `.env` 開啟或關閉。
 
 ## 功能
 
 - 從官方首頁取得真實文章 ID，天然支援跳號，也不會浪費請求猜測空號。
 - 日向坂只擷取 `.l-maincontents--blog .c-blog-article__text`，櫻坂只擷取 `article.post .box-article` 裡的圖片。
-- 將圖片分類儲存在 `images/成員名字/日期_部落格標題_ID/`，再傳送至 Discord。
+- 可選擇將圖片分類儲存在 `images/成員名字/日期_部落格標題_ID/`；停用本機儲存時仍會將官方圖片網址傳送至 Discord。
 - 每篇文章把標題、連結及最多 10 張圖片合併在同一則 Discord 訊息；超過 10 張時依 Discord 限制自動分批。
 - SQLite 保存掃描進度、已公告文章與已傳送圖片；程式重啟後會續跑且不重複傳送。
 - HTTP 暫時錯誤會重試，Discord 失敗時保留原編號供下次再試。
@@ -38,13 +38,23 @@
 DISCORD_BOT_TOKEN=你的Token
 DISCORD_CHANNEL_ID=日向坂頻道ID
 SAKURA_DISCORD_CHANNEL_ID=櫻坂頻道ID
+SAVE_IMAGES_LOCALLY=true
 ```
 
 再雙擊 `start.bat`。看到 `Discord connected` 即表示運作中。
 
 ## 本地圖片分類
 
-兩個團體都使用獨立子目錄：
+在 `.env` 選擇是否下載圖片：
+
+```dotenv
+# 儲存空間有限的 Raspberry Pi 建議設為 false
+SAVE_IMAGES_LOCALLY=false
+```
+
+設為 `false` 時不會下載或寫入任何部落格圖片；Discord 通知、圖片 embed、SQLite 去重與輪詢功能皆維持正常。可接受 `true/false`、`yes/no`、`on/off` 或 `1/0`。預設值為 `true`，以保留既有行為。
+
+啟用本機儲存時，兩個團體使用獨立子目錄：
 
 ```text
 images/
@@ -60,7 +70,7 @@ images/
 
 ## 首頁輪詢與跳號策略
 
-程式預設每 15 秒分別讀取日向坂及櫻坂首頁，兩個工作錯開 5 秒，從首頁連結直接擷取最新文章 ID。只有該團 SQLite 尚未標記為完整處理的文章，才會再讀取 detail 頁、下載圖片及通知 Discord。
+程式預設每 15 秒分別讀取日向坂及櫻坂首頁，兩個工作錯開 5 秒，從首頁連結直接擷取最新文章 ID。只有該團 SQLite 尚未標記為完整處理的文章，才會再讀取 detail 頁、依設定下載圖片並通知 Discord。
 
 任何團體第一次啟用時，都會將當下首頁文章視為 pending 並依發布順序處理；之後新出現在首頁的文章也會持續通知。程式不使用 ID 大小判斷新舊，因此即使網站稍後公開一篇較小 ID 的文章仍會被偵測。
 
@@ -111,7 +121,13 @@ chmod +x install_raspberry_pi.sh update_raspberry_pi.sh status_raspberry_pi.sh
 nano .env
 ```
 
-至少填入 Discord Token 與兩個頻道 ID，儲存後再次執行：
+至少填入 Discord Token 與兩個頻道 ID。Raspberry Pi 儲存空間有限時，同時設定：
+
+```dotenv
+SAVE_IMAGES_LOCALLY=false
+```
+
+儲存 `.env` 後再次執行：
 
 ```bash
 ./install_raspberry_pi.sh
@@ -154,6 +170,7 @@ cd ~/YOUR_REPOSITORY
 ### SD 卡與低功耗注意事項
 
 - `STATUS_LOG_INTERVAL_SECONDS=300` 會讓無新文章的狀態每 5 分鐘才寫入一次，減少 SD 卡寫入。
+- `SAVE_IMAGES_LOCALLY=false` 會完全略過圖片下載，僅保留容量很小的 SQLite 狀態與輪替日誌。
 - 日誌最多約 20 MB，SQLite 只在狀態變更時寫入。
 - 使用穩定的 Raspberry Pi 4 電源，並避免讓系統因供電不足反覆重啟。
 - `.env`、下載圖片、SQLite 與 logs 都被 `.gitignore` 排除，不會上傳 GitHub。
@@ -163,8 +180,8 @@ cd ~/YOUR_REPOSITORY
 - 執行記錄：`logs/watcher.log`
 - 日向坂去重資料：`data/watcher.db`
 - 櫻坂去重資料：`data/sakura_watcher.db`
-- 日向坂圖片：`images/日向坂46/成員名字/日期_部落格標題_ID/`
-- 櫻坂圖片：`images/櫻坂46/成員名字/日期_部落格標題_ID/`
+- 日向坂圖片（僅 `SAVE_IMAGES_LOCALLY=true`）：`images/日向坂46/成員名字/日期_部落格標題_ID/`
+- 櫻坂圖片（僅 `SAVE_IMAGES_LOCALLY=true`）：`images/櫻坂46/成員名字/日期_部落格標題_ID/`
 - 要重設單一團體，先關閉程式並備份後，只刪除該團的資料庫。刪除資料庫可能使當下首頁文章重新進入 pending，但 Discord 歷史比對仍會避免重傳已存在的內容。
 - `Forbidden (403)`：確認 Bot 在該頻道擁有 View Channel、Send Messages、Embed Links、Read Message History。
 - 修改 `.env` 後需要重新啟動 `start.bat`。

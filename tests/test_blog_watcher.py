@@ -1,8 +1,11 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from app import HinataWatcher, image_batches
+from app import Config, HinataWatcher, image_batches
 from blog_watcher import (
     BlogPost,
     BlogImageDownloader,
@@ -130,6 +133,46 @@ class LocalPathTests(unittest.TestCase):
         urls = [f"https://cdn.test/{index}.jpg" for index in range(23)]
         batches = image_batches(urls)
         self.assertEqual([len(batch) for batch in batches], [10, 10, 3])
+
+
+class ConfigTests(unittest.TestCase):
+    @staticmethod
+    def _minimum_env() -> dict[str, str]:
+        return {
+            "DISCORD_BOT_TOKEN": "test-token",
+            "DISCORD_CHANNEL_ID": "123456789012345678",
+            "SAKURA_DISCORD_CHANNEL_ID": "123456789012345679",
+        }
+
+    def test_local_image_storage_defaults_to_enabled(self):
+        with patch.dict("os.environ", self._minimum_env(), clear=True):
+            self.assertTrue(Config.from_env().save_images_locally)
+
+    def test_local_image_storage_can_be_disabled(self):
+        environment = self._minimum_env() | {"SAVE_IMAGES_LOCALLY": "false"}
+        with patch.dict("os.environ", environment, clear=True):
+            self.assertFalse(Config.from_env().save_images_locally)
+
+    def test_local_image_storage_rejects_invalid_value(self):
+        environment = self._minimum_env() | {"SAVE_IMAGES_LOCALLY": "sometimes"}
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "SAVE_IMAGES_LOCALLY"):
+                Config.from_env()
+
+    def test_disabled_storage_does_not_create_image_downloader(self):
+        environment = self._minimum_env() | {"SAVE_IMAGES_LOCALLY": "false"}
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+        watcher = SimpleNamespace(
+            http_session=object(),
+            config=config,
+            is_closed=lambda: True,
+        )
+        with patch("app.BlogImageDownloader") as downloader:
+            asyncio.run(
+                HinataWatcher.watch_forever(watcher, config.sources[0], object())
+            )
+        downloader.assert_not_called()
 
 
 class StateTests(unittest.TestCase):

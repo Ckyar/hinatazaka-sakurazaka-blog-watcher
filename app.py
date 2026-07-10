@@ -46,6 +46,17 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name, str(default)).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} 必須是 true/false、yes/no、on/off 或 1/0，目前是 {raw!r}"
+    )
+
+
 @dataclass(frozen=True)
 class SourceConfig:
     key: str
@@ -69,6 +80,7 @@ class Config:
     user_agent: str
     discord_history_limit: int
     status_log_interval: int
+    save_images_locally: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -121,6 +133,7 @@ class Config:
             user_agent=os.getenv("USER_AGENT", "SakamichiBlogWatcher/1.0"),
             discord_history_limit=_positive_int("DISCORD_HISTORY_LIMIT", 500),
             status_log_interval=_positive_int("STATUS_LOG_INTERVAL_SECONDS", 300),
+            save_images_locally=_boolean("SAVE_IMAGES_LOCALLY", True),
         )
 
 
@@ -162,6 +175,10 @@ class MultiBlogWatcher(discord.Client):
 
     async def on_ready(self) -> None:
         self.log.info("Discord connected as %s", self.user)
+        self.log.info(
+            "Local image storage is %s",
+            "enabled" if self.config.save_images_locally else "disabled",
+        )
         if self.reactivated_posts:
             self.log.info(
                 "櫻坂46 reactivated %s previously ignored homepage item(s)",
@@ -338,11 +355,15 @@ class MultiBlogWatcher(discord.Client):
             self.config.timeout,
             self.config.retries,
         )
-        downloader = BlogImageDownloader(
-            self.http_session,
-            source.image_dir,
-            self.config.timeout,
-            self.config.retries,
+        downloader = (
+            BlogImageDownloader(
+                self.http_session,
+                source.image_dir,
+                self.config.timeout,
+                self.config.retries,
+            )
+            if self.config.save_images_locally
+            else None
         )
         if source.initial_delay:
             await asyncio.sleep(source.initial_delay)
@@ -397,16 +418,17 @@ class MultiBlogWatcher(discord.Client):
                             len(post.image_urls),
                             post.title,
                         )
-                        saved_images = await downloader.download_post(post)
-                        self.log.info(
-                            "%s blog ID %s stored in %s (%s image(s))",
-                            source.name,
-                            post_id,
-                            saved_images[0].parent
-                            if saved_images
-                            else source.image_dir,
-                            len(saved_images),
-                        )
+                        if downloader is not None:
+                            saved_images = await downloader.download_post(post)
+                            self.log.info(
+                                "%s blog ID %s stored in %s (%s image(s))",
+                                source.name,
+                                post_id,
+                                saved_images[0].parent
+                                if saved_images
+                                else source.image_dir,
+                                len(saved_images),
+                            )
                         await self.announce(source, state, post)
                     except asyncio.CancelledError:
                         raise
