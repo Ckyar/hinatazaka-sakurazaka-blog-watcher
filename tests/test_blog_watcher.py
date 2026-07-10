@@ -3,22 +3,22 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from app import Config, HinataWatcher, image_batches
+from app import Config, HinataWatcher, image_batches, member_mention_ids
 from blog_watcher import (
     BlogPost,
     BlogImageDownloader,
     StateStore,
     post_directory,
     safe_path_component,
-    parse_blog,
+    parse_hinata_blog,
     parse_blog_index,
     parse_sakura_blog,
 )
 
 
-BLOG_HTML = """
+HINATA_BLOG_HTML = """
 <html><head><title>公式ブログ</title></head><body>
 <div class="l-maincontents--blog"><div class="p-blog-article">
   <div class="c-blog-article__title">測試標題</div>
@@ -33,7 +33,7 @@ BLOG_HTML = """
 </body></html>
 """
 
-INDEX_HTML = """
+HINATA_INDEX_HTML = """
 <html><body>
   <a href="/s/official/diary/detail/70153?ima=0000">newest</a>
   <a href="/s/official/diary/detail/70150?ima=0000">second</a>
@@ -60,7 +60,9 @@ SAKURA_BLOG_HTML = """
 
 class ParserTests(unittest.TestCase):
     def test_extracts_unique_homepage_ids_in_display_order(self):
-        self.assertEqual(parse_blog_index(INDEX_HTML), (70153, 70150, 70143))
+        self.assertEqual(
+            parse_blog_index(HINATA_INDEX_HTML), (70153, 70150, 70143)
+        )
 
     def test_empty_homepage_has_no_ids(self):
         self.assertEqual(parse_blog_index(""), ())
@@ -87,7 +89,7 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(post.title, "無題")
 
     def test_extracts_only_unique_article_images(self):
-        post = parse_blog(70143, BLOG_HTML)
+        post = parse_hinata_blog(70143, HINATA_BLOG_HTML)
         self.assertIsNotNone(post)
         assert post is not None
         self.assertEqual(post.title, "測試標題")
@@ -101,9 +103,11 @@ class ParserTests(unittest.TestCase):
         )
 
     def test_rejects_empty_or_non_blog_pages(self):
-        self.assertIsNone(parse_blog(1, ""))
-        self.assertIsNone(parse_blog(1, "<html><body>news</body></html>"))
-        self.assertIsNone(parse_blog(1, "<html><body>ブログ only</body></html>"))
+        self.assertIsNone(parse_hinata_blog(1, ""))
+        self.assertIsNone(parse_hinata_blog(1, "<html><body>news</body></html>"))
+        self.assertIsNone(
+            parse_hinata_blog(1, "<html><body>ブログ only</body></html>")
+        )
 
 
 class LocalPathTests(unittest.TestCase):
@@ -140,7 +144,7 @@ class ConfigTests(unittest.TestCase):
     def _minimum_env() -> dict[str, str]:
         return {
             "DISCORD_BOT_TOKEN": "test-token",
-            "DISCORD_CHANNEL_ID": "123456789012345678",
+            "HINATA_DISCORD_CHANNEL_ID": "123456789012345678",
             "SAKURA_DISCORD_CHANNEL_ID": "123456789012345679",
         }
 
@@ -173,6 +177,34 @@ class ConfigTests(unittest.TestCase):
                 HinataWatcher.watch_forever(watcher, config.sources[0], object())
             )
         downloader.assert_not_called()
+
+    def test_each_group_has_independent_member_mentions(self):
+        environment = self._minimum_env() | {
+            "HINATA_MEMBER_MENTIONS": (
+                '{"高井 俐香":["111111111111111111","222222222222222222"]}'
+            ),
+            "SAKURA_MEMBER_MENTIONS": '{"的野 美青":"333333333333333333"}',
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+
+        self.assertEqual(
+            member_mention_ids(config.sources[0], "高井　俐香"),
+            (111111111111111111, 222222222222222222),
+        )
+        self.assertEqual(
+            member_mention_ids(config.sources[1], "的野 美青"),
+            (333333333333333333,),
+        )
+        self.assertEqual(member_mention_ids(config.sources[0], "的野 美青"), ())
+
+    def test_member_mentions_reject_invalid_discord_id(self):
+        environment = self._minimum_env() | {
+            "HINATA_MEMBER_MENTIONS": '{"高井 俐香":["not-an-id"]}'
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "HINATA_MEMBER_MENTIONS"):
+                Config.from_env()
 
 
 class StateTests(unittest.TestCase):
@@ -221,6 +253,51 @@ class StateTests(unittest.TestCase):
             self.assertFalse(state.post_completed(100))
             self.assertTrue(state.post_completed(101))
             self.assertEqual(state.enable_previously_ignored_posts(), 0)
+            state.close()
+
+
+class MentionNotificationTests(unittest.TestCase):
+    def test_only_first_discord_batch_mentions_configured_users(self):
+        environment = ConfigTests._minimum_env() | {
+            "HINATA_MEMBER_MENTIONS": '{"高井 俐香":["111111111111111111"]}'
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            source = Config.from_env().sources[0]
+
+        post = BlogPost(
+            post_id=70143,
+            url="https://example.test/70143",
+            title="title",
+            author="高井 俐香",
+            published_at="2026.7.10 12:00",
+            image_urls=tuple(
+                f"https://cdn.test/{index}.jpg" for index in range(11)
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = StateStore(Path(directory) / "state.db")
+            watcher = object.__new__(HinataWatcher)
+            watcher.log = Mock()
+            channel = SimpleNamespace(send=AsyncMock())
+            watcher.get_target_channel = AsyncMock(return_value=channel)
+            watcher.reconcile_discord_history = AsyncMock()
+
+            with patch("app.asyncio.sleep", new=AsyncMock()):
+                asyncio.run(watcher.announce(source, state, post))
+
+            self.assertEqual(channel.send.await_count, 2)
+            first_call, second_call = channel.send.await_args_list
+            self.assertTrue(
+                first_call.kwargs["content"].startswith("<@111111111111111111>\n")
+            )
+            self.assertEqual(
+                first_call.kwargs["allowed_mentions"].to_dict()["users"],
+                [111111111111111111],
+            )
+            self.assertIsNone(second_call.kwargs["content"])
+            self.assertNotIn(
+                "users", second_call.kwargs["allowed_mentions"].to_dict()
+            )
             state.close()
 
 

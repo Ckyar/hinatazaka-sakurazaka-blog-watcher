@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
+import unicodedata
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -57,6 +59,44 @@ def _boolean(name: str, default: bool) -> bool:
     )
 
 
+def _normalize_member_name(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _member_mentions(name: str) -> dict[str, tuple[int, ...]]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        configured = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{name} 必須是有效的單行 JSON object") from error
+    if not isinstance(configured, dict):
+        raise ValueError(f"{name} 必須是成員名字對 Discord 使用者 ID 的 JSON object")
+
+    mentions: dict[str, tuple[int, ...]] = {}
+    for member, configured_ids in configured.items():
+        if not isinstance(member, str) or not _normalize_member_name(member):
+            raise ValueError(f"{name} 包含無效的成員名字")
+        if isinstance(configured_ids, (str, int)):
+            configured_ids = [configured_ids]
+        if not isinstance(configured_ids, list) or not configured_ids:
+            raise ValueError(f"{name} 的 {member!r} 必須至少設定一個使用者 ID")
+
+        user_ids: list[int] = []
+        for configured_id in configured_ids:
+            user_id = str(configured_id).strip()
+            if not user_id.isdigit() or int(user_id) <= 0:
+                raise ValueError(
+                    f"{name} 的 {member!r} 包含無效的 Discord 使用者 ID"
+                )
+            numeric_id = int(user_id)
+            if numeric_id not in user_ids:
+                user_ids.append(numeric_id)
+        mentions[_normalize_member_name(member)] = tuple(user_ids)
+    return mentions
+
+
 @dataclass(frozen=True)
 class SourceConfig:
     key: str
@@ -69,6 +109,11 @@ class SourceConfig:
     initial_delay: int
     state_db: Path
     image_dir: Path
+    member_mentions: dict[str, tuple[int, ...]]
+
+
+def member_mention_ids(source: SourceConfig, author: str) -> tuple[int, ...]:
+    return source.member_mentions.get(_normalize_member_name(author), ())
 
 
 @dataclass(frozen=True)
@@ -98,19 +143,20 @@ class Config:
             path = Path(os.getenv(name, default))
             return path if path.is_absolute() else ROOT / path
 
-        interval = _positive_int("CHECK_INTERVAL_SECONDS", 15)
+        interval = _positive_int("HINATA_CHECK_INTERVAL_SECONDS", 15)
         sources = (
             SourceConfig(
                 key="hinata",
                 name="日向坂46",
-                channel_id=channel_id("DISCORD_CHANNEL_ID"),
+                channel_id=channel_id("HINATA_DISCORD_CHANNEL_ID"),
                 index_url=HINATA_INDEX_URL,
                 detail_url=HINATA_DETAIL_URL,
                 parser=parse_hinata_blog,
                 interval=interval,
                 initial_delay=0,
-                state_db=local_path("STATE_DB", "data/watcher.db"),
-                image_dir=local_path("IMAGE_DIR", "images/日向坂46"),
+                state_db=local_path("HINATA_STATE_DB", "data/watcher.db"),
+                image_dir=local_path("HINATA_IMAGE_DIR", "images/日向坂46"),
+                member_mentions=_member_mentions("HINATA_MEMBER_MENTIONS"),
             ),
             SourceConfig(
                 key="sakura",
@@ -123,6 +169,7 @@ class Config:
                 initial_delay=5,
                 state_db=local_path("SAKURA_STATE_DB", "data/sakura_watcher.db"),
                 image_dir=local_path("SAKURA_IMAGE_DIR", "images/櫻坂46"),
+                member_mentions=_member_mentions("SAKURA_MEMBER_MENTIONS"),
             ),
         )
         return cls(
@@ -296,9 +343,19 @@ class MultiBlogWatcher(discord.Client):
             return
 
         needs_heading = not state.post_announced(post.post_id)
+        mention_ids = member_mention_ids(source, post.author)
+        mention_line = " ".join(f"<@{user_id}>" for user_id in mention_ids)
         heading = f"🆕 **[{source.name}] {post.title}**"
         details = " · ".join(part for part in (post.author, post.published_at) if part)
-        heading_content = f"{heading}\n{details}\n<{post.url}>"
+        heading_content = "\n".join(
+            part for part in (mention_line, heading, details, f"<{post.url}>") if part
+        )
+        heading_mentions = discord.AllowedMentions(
+            everyone=False,
+            users=[discord.Object(id=user_id) for user_id in mention_ids],
+            roles=False,
+            replied_user=False,
+        )
         missing_images = [
             image_url
             for image_url in post.image_urls
@@ -307,7 +364,10 @@ class MultiBlogWatcher(discord.Client):
 
         if not missing_images:
             if needs_heading:
-                await channel.send(heading_content)
+                await channel.send(
+                    heading_content,
+                    allowed_mentions=heading_mentions,
+                )
                 state.mark_post_announced(post.post_id)
             state.mark_post_completed(post.post_id)
             self.log.info(
@@ -320,7 +380,15 @@ class MultiBlogWatcher(discord.Client):
         for batch_number, image_urls in enumerate(batches, start=1):
             embeds = [discord.Embed().set_image(url=image_url) for image_url in image_urls]
             content = heading_content if needs_heading and batch_number == 1 else None
-            await channel.send(content=content, embeds=embeds)
+            await channel.send(
+                content=content,
+                embeds=embeds,
+                allowed_mentions=(
+                    heading_mentions
+                    if content is not None
+                    else discord.AllowedMentions.none()
+                ),
+            )
             if content is not None:
                 state.mark_post_announced(post.post_id)
             for image_url in image_urls:

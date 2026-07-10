@@ -149,10 +149,6 @@ def parse_blog_index(html: str) -> tuple[int, ...]:
     return tuple(post_ids)
 
 
-# Backwards-compatible aliases for the original single-site tests/imports.
-parse_blog = parse_hinata_blog
-
-
 class StateStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,23 @@
 
 程式會以兩層方式避免重傳：首先查詢各團獨立的 SQLite；若本地紀錄不完整，再檢查對應 Discord 頻道歷史，只比對 Bot 自己送出的文章與圖片網址。`DISCORD_HISTORY_LIMIT` 預設為 500，可在 `.env` 調整。若沒有 Read Message History 權限，仍會使用本地 SQLite 去重。
 
+## 指定成員發文時 Tag 使用者
+
+先在 Discord 開啟「開發者模式」，右鍵點要通知的使用者並選擇「複製使用者 ID」。在 `.env` 分別設定兩個團體的單行 JSON：
+
+```dotenv
+HINATA_MEMBER_MENTIONS={"小坂 菜緒":["111111111111111111"],"高井 俐香":["222222222222222222","333333333333333333"]}
+SAKURA_MEMBER_MENTIONS={"的野 美青":["444444444444444444"]}
+```
+
+- JSON key 必須是官方部落格顯示的成員名字；一般空格與全形空格會自動正規化。
+- 每位成員可以設定一個或多個 Discord 使用者 ID；建議將 ID 寫成字串。
+- 沒有任何規則時設定為 `{}`。
+- Tag 只放在該篇文章的第一則標題通知；圖片超過 10 張而分批時不會重複 ping。
+- 程式只允許設定中的使用者 mention，會封鎖訊息文字意外產生的 `@everyone` 與角色 mention。
+- 被 Tag 的使用者仍需具有該頻道的 View Channel 權限；一般使用者 Tag 不需要 Bot 額外取得 Mention Everyone 權限。
+- 修改 `.env` 後重新啟動 Bot 才會生效。
+
 ## 2. Windows 安裝
 
 先安裝 [Python 3.10 以上版本](https://www.python.org/downloads/windows/)，安裝時勾選 **Add Python to PATH**。
@@ -36,12 +53,23 @@
 
 ```dotenv
 DISCORD_BOT_TOKEN=你的Token
-DISCORD_CHANNEL_ID=日向坂頻道ID
+HINATA_DISCORD_CHANNEL_ID=日向坂頻道ID
 SAKURA_DISCORD_CHANNEL_ID=櫻坂頻道ID
 SAVE_IMAGES_LOCALLY=true
 ```
 
 再雙擊 `start.bat`。看到 `Discord connected` 即表示運作中。
+
+從舊版升級時，請在每台主機自己的 `.env` 將日向坂設定重新命名；設定值保持不變：
+
+```text
+DISCORD_CHANNEL_ID       → HINATA_DISCORD_CHANNEL_ID
+CHECK_INTERVAL_SECONDS   → HINATA_CHECK_INTERVAL_SECONDS
+STATE_DB                 → HINATA_STATE_DB
+IMAGE_DIR                → HINATA_IMAGE_DIR
+```
+
+`.env` 不會由 Git 同步，因此 Windows 與 Raspberry Pi 都需要各自修改一次。
 
 ## 本地圖片分類
 
@@ -66,7 +94,7 @@ images/
       └─ 2026-07-07_無題_70124/
 ```
 
-可分別使用 `IMAGE_DIR` 與 `SAKURA_IMAGE_DIR` 改變儲存位置。Windows 不允許的檔名字元會自動替換成底線，過長標題也會安全截短；下載會先寫入 `.part` 暫存檔，完成後才改成正式檔名。重新掃描時，已完整存在的圖片不會再次下載。
+可分別使用 `HINATA_IMAGE_DIR` 與 `SAKURA_IMAGE_DIR` 改變儲存位置。Windows 不允許的檔名字元會自動替換成底線，過長標題也會安全截短；下載會先寫入 `.part` 暫存檔，完成後才改成正式檔名。重新掃描時，已完整存在的圖片不會再次下載。
 
 ## 首頁輪詢與跳號策略
 
@@ -81,7 +109,7 @@ images/
 櫻坂46 homepage poll found 12 article(s); 0 pending
 ```
 
-可用 `CHECK_INTERVAL_SECONDS` 和 `SAKURA_CHECK_INTERVAL_SECONDS` 分別調整輪詢秒數；預設值皆為 15。
+可用 `HINATA_CHECK_INTERVAL_SECONDS` 和 `SAKURA_CHECK_INTERVAL_SECONDS` 分別調整輪詢秒數；預設值皆為 15。
 
 ## 24 小時自動啟動（工作排程器）
 
