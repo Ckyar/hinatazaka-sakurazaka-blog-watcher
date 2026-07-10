@@ -1,0 +1,28 @@
+[Unit]
+Description=Sakamichi Blog Image Discord Watcher
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@@USER@@
+Group=@@GROUP@@
+WorkingDirectory=@@PROJECT_DIR@@
+ExecStart=@@PROJECT_DIR@@/.venv/bin/python @@PROJECT_DIR@@/app.py
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@@PROJECT_DIR@@/data @@PROJECT_DIR@@/images @@PROJECT_DIR@@/logs
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
