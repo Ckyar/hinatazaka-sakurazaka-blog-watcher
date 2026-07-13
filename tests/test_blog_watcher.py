@@ -418,6 +418,60 @@ class SubscriptionCommandTests(unittest.TestCase):
             )
             store.close()
 
+    def test_batch_subscribe_and_unsubscribe_with_partial_matches(self):
+        environment = ConfigTests._minimum_env() | {
+            "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+            watcher = object.__new__(HinataWatcher)
+            watcher.config = config
+            watcher.subscriptions = store
+            watcher.get_member_catalog = AsyncMock(
+                return_value={
+                    "小坂菜緒": "小坂 菜緒",
+                    "大野愛実": "大野 愛実",
+                    "正源司陽子": "正源司 陽子",
+                }
+            )
+            guild = SimpleNamespace(id=1)
+            author = SimpleNamespace(id=10, bot=False)
+            channel = SimpleNamespace(id=config.subscription_channel_id)
+
+            async def run_command(content: str):
+                message = SimpleNamespace(
+                    content=content,
+                    guild=guild,
+                    author=author,
+                    channel=channel,
+                    reply=AsyncMock(),
+                )
+                await watcher.handle_subscription_message(message)
+                return message.reply.await_args.args[0]
+
+            response = asyncio.run(
+                run_command(
+                    "!關注 日向坂46 小坂菜緒、大野 愛実、"
+                    "小坂 菜緒、不存在成員"
+                )
+            )
+            self.assertIn("已成功關注：小坂 菜緒、大野 愛実", response)
+            self.assertIn("找不到日向坂46官方成員：不存在成員", response)
+            self.assertEqual(
+                store.user_subscriptions(guild.id, author.id),
+                (("hinata", "大野 愛実"), ("hinata", "小坂 菜緒")),
+            )
+
+            response = asyncio.run(
+                run_command("!取消關注 日向坂46 小坂菜緒\n大野愛実\n正源司陽子")
+            )
+            self.assertIn("已取消關注：小坂 菜緒、大野 愛実", response)
+            self.assertIn("原本沒有關注：正源司 陽子", response)
+            self.assertEqual(store.user_subscriptions(guild.id, author.id), ())
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

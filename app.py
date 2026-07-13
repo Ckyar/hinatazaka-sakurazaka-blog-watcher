@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -69,6 +70,20 @@ def _normalize_member_name(value: str) -> str:
 
 def _member_lookup_key(value: str) -> str:
     return "".join(_normalize_member_name(value).split())
+
+
+def _split_member_names(value: str) -> tuple[str, ...]:
+    """Split a batch while preserving spaces that are part of member names."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in re.split(r"[,，、;；\r\n]+", value):
+        name = _normalize_member_name(item)
+        key = _member_lookup_key(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return tuple(names)
 
 
 def _member_mentions(name: str) -> dict[str, tuple[int, ...]]:
@@ -393,9 +408,10 @@ class MultiBlogWatcher(discord.Client):
         if command in help_commands:
             await message.reply(
                 "可用指令：\n"
-                "`!關注 <日向坂46|櫻坂46> <成員名字>`\n"
-                "`!取消關注 <日向坂46|櫻坂46> <成員名字>`\n"
-                "`!我的關注`",
+                "`!關注 <日向坂46|櫻坂46> <成員名字>[、<成員名字>...]`\n"
+                "`!取消關注 <日向坂46|櫻坂46> <成員名字>[、<成員名字>...]`\n"
+                "`!我的關注`\n"
+                "多位成員請用 `、`、逗號、分號或換行分隔。",
                 mention_author=False,
             )
             return
@@ -420,7 +436,8 @@ class MultiBlogWatcher(discord.Client):
 
         if len(parts) != 3:
             await message.reply(
-                "格式錯誤，請使用：`!關注 <日向坂46|櫻坂46> <成員名字>`",
+                "格式錯誤，請使用："
+                "`!關注 <日向坂46|櫻坂46> <成員名字>[、<成員名字>...]`",
                 mention_author=False,
             )
             return
@@ -443,39 +460,61 @@ class MultiBlogWatcher(discord.Client):
             )
             return
 
-        member_key = _member_lookup_key(parts[2])
-        member_name = catalog.get(member_key)
-        if member_name is None:
+        requested_names = _split_member_names(parts[2])
+        if not requested_names:
             await message.reply(
-                f"找不到「{parts[2]}」，請確認是{source.name}官方成員名字。",
+                "請至少輸入一位成員；多位成員請用 `、`、逗號、分號或換行分隔。",
                 mention_author=False,
             )
             return
 
+        changed_names: list[str] = []
+        unchanged_names: list[str] = []
+        unknown_names: list[str] = []
+        for requested_name in requested_names:
+            member_key = _member_lookup_key(requested_name)
+            member_name = catalog.get(member_key)
+            if member_name is None:
+                unknown_names.append(requested_name)
+                continue
+
+            if command in subscribe_commands:
+                changed = self.subscriptions.subscribe(
+                    message.guild.id,
+                    message.author.id,
+                    source.key,
+                    member_key,
+                    member_name,
+                )
+            else:
+                changed = self.subscriptions.unsubscribe(
+                    message.guild.id,
+                    message.author.id,
+                    source.key,
+                    member_key,
+                )
+            (changed_names if changed else unchanged_names).append(member_name)
+
+        response_lines = [f"{source.name}關注處理完成："]
         if command in subscribe_commands:
-            changed = self.subscriptions.subscribe(
-                message.guild.id,
-                message.author.id,
-                source.key,
-                member_key,
-                member_name,
-            )
-            if changed:
-                response = f"✅ 已成功關注 {source.name}「{member_name}」。"
-            else:
-                response = f"ℹ️ 你已經關注 {source.name}「{member_name}」，不會重複建立。"
+            if changed_names:
+                response_lines.append(f"✅ 已成功關注：{'、'.join(changed_names)}")
+            if unchanged_names:
+                response_lines.append(
+                    f"ℹ️ 已經關注，不會重複建立：{'、'.join(unchanged_names)}"
+                )
         else:
-            changed = self.subscriptions.unsubscribe(
-                message.guild.id,
-                message.author.id,
-                source.key,
-                member_key,
+            if changed_names:
+                response_lines.append(f"✅ 已取消關注：{'、'.join(changed_names)}")
+            if unchanged_names:
+                response_lines.append(
+                    f"ℹ️ 原本沒有關注：{'、'.join(unchanged_names)}"
+                )
+        if unknown_names:
+            response_lines.append(
+                f"⚠️ 找不到{source.name}官方成員：{'、'.join(unknown_names)}"
             )
-            if changed:
-                response = f"✅ 已取消關注 {source.name}「{member_name}」。"
-            else:
-                response = f"ℹ️ 你目前沒有關注 {source.name}「{member_name}」。"
-        await message.reply(response, mention_author=False)
+        await message.reply("\n".join(response_lines), mention_author=False)
 
     async def get_target_channel(
         self, source: SourceConfig
