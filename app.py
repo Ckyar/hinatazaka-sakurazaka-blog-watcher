@@ -236,6 +236,10 @@ class MultiBlogWatcher(discord.Client):
     def __init__(self, config: Config) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
+        # Receive MESSAGE_CREATE events from server text channels.  The
+        # message_content intent only exposes the text fields; it does not
+        # subscribe the client to guild message events by itself.
+        intents.guild_messages = True
         intents.message_content = True
         super().__init__(intents=intents)
         self.config = config
