@@ -16,9 +16,11 @@ from bs4 import BeautifulSoup
 HINATA_BASE_URL = "https://www.hinatazaka46.com"
 HINATA_DETAIL_URL = HINATA_BASE_URL + "/s/official/diary/detail/{post_id}"
 HINATA_INDEX_URL = HINATA_BASE_URL + "/s/official/diary/member?ima=0000"
+HINATA_MEMBER_INDEX_URL = HINATA_BASE_URL + "/s/official/search/artist"
 SAKURA_BASE_URL = "https://sakurazaka46.com"
 SAKURA_DETAIL_URL = SAKURA_BASE_URL + "/s/s46/diary/detail/{post_id}?cd=blog"
 SAKURA_INDEX_URL = SAKURA_BASE_URL + "/s/s46/diary/blog/list"
+SAKURA_MEMBER_INDEX_URL = SAKURA_BASE_URL + "/s/s46/search/artist"
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{number}" for number in range(1, 10)),
@@ -149,6 +151,27 @@ def parse_blog_index(html: str) -> tuple[int, ...]:
     return tuple(post_ids)
 
 
+def parse_member_names(html: str, group_key: str) -> tuple[str, ...]:
+    """Extract current member display names from an official member page."""
+    if not html.strip():
+        return ()
+    selectors = {
+        "hinata": 'a[href*="/s/official/artist/"] .c-member__name',
+        "sakura": 'a[href*="/s/s46/artist/"] p.name',
+    }
+    try:
+        selector = selectors[group_key]
+    except KeyError as error:
+        raise ValueError(f"Unknown member group: {group_key}") from error
+
+    soup = BeautifulSoup(html, "html.parser")
+    names = (
+        re.sub(r"\s+", " ", element.get_text(" ", strip=True)).strip()
+        for element in soup.select(selector)
+    )
+    return _unique(names)
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,6 +282,84 @@ class StateStore:
         )
         self.connection.commit()
         return cursor.rowcount
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+class SubscriptionStore:
+    """Persist per-server subscriptions independently from blog processing state."""
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                group_key TEXT NOT NULL,
+                member_key TEXT NOT NULL,
+                member_name TEXT NOT NULL,
+                subscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, user_id, group_key, member_key)
+            );
+            CREATE INDEX IF NOT EXISTS subscriptions_lookup
+                ON subscriptions(guild_id, group_key, member_key);
+            """
+        )
+        self.connection.commit()
+
+    def subscribe(
+        self,
+        guild_id: int,
+        user_id: int,
+        group_key: str,
+        member_key: str,
+        member_name: str,
+    ) -> bool:
+        cursor = self.connection.execute(
+            "INSERT OR IGNORE INTO subscriptions "
+            "(guild_id, user_id, group_key, member_key, member_name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, group_key, member_key, member_name),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def unsubscribe(
+        self, guild_id: int, user_id: int, group_key: str, member_key: str
+    ) -> bool:
+        cursor = self.connection.execute(
+            "DELETE FROM subscriptions "
+            "WHERE guild_id = ? AND user_id = ? AND group_key = ? AND member_key = ?",
+            (guild_id, user_id, group_key, member_key),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def subscriber_ids(
+        self, guild_id: int, group_key: str, member_key: str
+    ) -> tuple[int, ...]:
+        rows = self.connection.execute(
+            "SELECT user_id FROM subscriptions "
+            "WHERE guild_id = ? AND group_key = ? AND member_key = ? "
+            "ORDER BY user_id",
+            (guild_id, group_key, member_key),
+        ).fetchall()
+        return tuple(int(row[0]) for row in rows)
+
+    def user_subscriptions(
+        self, guild_id: int, user_id: int
+    ) -> tuple[tuple[str, str], ...]:
+        rows = self.connection.execute(
+            "SELECT group_key, member_name FROM subscriptions "
+            "WHERE guild_id = ? AND user_id = ? "
+            "ORDER BY group_key, member_name",
+            (guild_id, user_id),
+        ).fetchall()
+        return tuple((str(row[0]), str(row[1])) for row in rows)
 
     def close(self) -> None:
         self.connection.close()

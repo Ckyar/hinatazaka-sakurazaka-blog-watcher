@@ -9,6 +9,8 @@
 - 可選擇將圖片分類儲存在 `images/成員名字/日期_部落格標題_ID/`；停用本機儲存時仍會將官方圖片網址傳送至 Discord。
 - 每篇文章把標題、連結及最多 10 張圖片合併在同一則 Discord 訊息；超過 10 張時依 Discord 限制自動分批。
 - SQLite 保存掃描進度、已公告文章與已傳送圖片；程式重啟後會續跑且不重複傳送。
+- 可在同一伺服器的訂閱頻道使用 `!關注`、`!取消關注` 與 `!我的關注`，依成員姓名訂閱兩團部落格；該成員發文時只 Tag 同伺服器的訂閱者。
+- 成員名單從兩團官方成員頁讀取並定期更新，輸入姓名時會忽略姓與名之間的空白。
 - HTTP 暫時錯誤會重試，Discord 失敗時保留原編號供下次再試。
 - 記錄檔自動輪替，適合長時間運作。
 
@@ -21,10 +23,11 @@
    - Send Messages
    - Embed Links
    - Read Message History
+   - 訂閱頻道也必須允許一般成員 Send Messages；部落格通知頻道則可依需求將一般成員設為唯讀。
 4. 用產生的網址邀請 Bot 進伺服器。
 5. Discord 設定中開啟「開發者模式」，右鍵點目標頻道 →「複製頻道 ID」。
 
-本程式不讀取聊天內容，因此不需要 Message Content Intent。
+若要啟用成員訂閱指令，請在 **Bot → Privileged Gateway Intents** 開啟 **Message Content Intent**；程式只處理 `.env` 指定的訂閱頻道，其他頻道訊息不會被當作指令。
 
 程式會以兩層方式避免重傳：首先查詢各團獨立的 SQLite；若本地紀錄不完整，再檢查對應 Discord 頻道歷史，只比對 Bot 自己送出的文章與圖片網址。`DISCORD_HISTORY_LIMIT` 預設為 500，可在 `.env` 調整。若沒有 Read Message History 權限，仍會使用本地 SQLite 去重。
 
@@ -44,6 +47,32 @@ SAKURA_MEMBER_MENTIONS={"的野 美青":["444444444444444444"]}
 - 程式只允許設定中的使用者 mention，會封鎖訊息文字意外產生的 `@everyone` 與角色 mention。
 - 被 Tag 的使用者仍需具有該頻道的 View Channel 權限；一般使用者 Tag 不需要 Bot 額外取得 Mention Everyone 權限。
 - 修改 `.env` 後重新啟動 Bot 才會生效。
+
+## 成員自助訂閱
+
+在 `.env` 指定新開的訂閱頻道：
+
+```dotenv
+SUBSCRIPTION_CHANNEL_ID=訂閱頻道ID
+SUBSCRIPTION_DB=data/subscriptions.db
+MEMBER_CATALOG_REFRESH_SECONDS=3600
+```
+
+訂閱頻道的 `@everyone` 必須允許 View Channel、Send Messages；Bot 需要 View Channel、Send Messages 與 Read Message History。這個頻道不能套用部落格通知頻道的唯讀規則。
+
+可用指令：
+
+```text
+!關注 日向坂46 小坂菜緒
+!關注 櫻坂46 的野美青
+!取消關注 日向坂46 小坂 菜緒
+!我的關注
+!關注說明
+```
+
+也接受 `!訂閱`、`!取消訂閱`、`!subscribe`、`!unsubscribe` 等別名；團體可輸入 `日向`、`hinata`、`櫻坂` 或 `sakura`。輸入 `小坂菜緒` 與 `小坂 菜緒` 會視為同一位成員。
+
+訂閱關係以 `guild_id + Discord 使用者 ID + 團體 + 成員` 保存，因此同一位使用者在不同伺服器的關注清單彼此獨立。重複關注不會新增重複資料，取消不存在的關注也會回覆提示。
 
 ## 2. Windows 安裝
 

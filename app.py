@@ -22,11 +22,15 @@ from blog_watcher import (
     BlogPost,
     HINATA_DETAIL_URL,
     HINATA_INDEX_URL,
+    HINATA_MEMBER_INDEX_URL,
     SAKURA_DETAIL_URL,
     SAKURA_INDEX_URL,
+    SAKURA_MEMBER_INDEX_URL,
     StateStore,
+    SubscriptionStore,
     parse_hinata_blog,
     parse_blog_index,
+    parse_member_names,
     parse_sakura_blog,
 )
 
@@ -63,6 +67,10 @@ def _normalize_member_name(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split())
 
 
+def _member_lookup_key(value: str) -> str:
+    return "".join(_normalize_member_name(value).split())
+
+
 def _member_mentions(name: str) -> dict[str, tuple[int, ...]]:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -93,8 +101,17 @@ def _member_mentions(name: str) -> dict[str, tuple[int, ...]]:
             numeric_id = int(user_id)
             if numeric_id not in user_ids:
                 user_ids.append(numeric_id)
-        mentions[_normalize_member_name(member)] = tuple(user_ids)
+        mentions[_member_lookup_key(member)] = tuple(user_ids)
     return mentions
+
+
+def _optional_channel_id(name: str) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw or raw == "0":
+        return 0
+    if not raw.isdigit():
+        raise ValueError(f"{name} 必須是數字格式的 Discord 頻道 ID")
+    return int(raw)
 
 
 @dataclass(frozen=True)
@@ -104,6 +121,7 @@ class SourceConfig:
     channel_id: int
     index_url: str
     detail_url: str
+    member_index_url: str
     parser: Callable[[int, str], BlogPost | None]
     interval: int
     initial_delay: int
@@ -113,7 +131,7 @@ class SourceConfig:
 
 
 def member_mention_ids(source: SourceConfig, author: str) -> tuple[int, ...]:
-    return source.member_mentions.get(_normalize_member_name(author), ())
+    return source.member_mentions.get(_member_lookup_key(author), ())
 
 
 @dataclass(frozen=True)
@@ -126,6 +144,9 @@ class Config:
     discord_history_limit: int
     status_log_interval: int
     save_images_locally: bool
+    subscription_channel_id: int
+    subscription_db: Path
+    member_catalog_refresh_seconds: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -151,6 +172,7 @@ class Config:
                 channel_id=channel_id("HINATA_DISCORD_CHANNEL_ID"),
                 index_url=HINATA_INDEX_URL,
                 detail_url=HINATA_DETAIL_URL,
+                member_index_url=HINATA_MEMBER_INDEX_URL,
                 parser=parse_hinata_blog,
                 interval=interval,
                 initial_delay=0,
@@ -164,6 +186,7 @@ class Config:
                 channel_id=channel_id("SAKURA_DISCORD_CHANNEL_ID"),
                 index_url=SAKURA_INDEX_URL,
                 detail_url=SAKURA_DETAIL_URL,
+                member_index_url=SAKURA_MEMBER_INDEX_URL,
                 parser=parse_sakura_blog,
                 interval=_positive_int("SAKURA_CHECK_INTERVAL_SECONDS", 15),
                 initial_delay=5,
@@ -181,6 +204,13 @@ class Config:
             discord_history_limit=_positive_int("DISCORD_HISTORY_LIMIT", 500),
             status_log_interval=_positive_int("STATUS_LOG_INTERVAL_SECONDS", 300),
             save_images_locally=_boolean("SAVE_IMAGES_LOCALLY", True),
+            subscription_channel_id=_optional_channel_id("SUBSCRIPTION_CHANNEL_ID"),
+            subscription_db=local_path(
+                "SUBSCRIPTION_DB", "data/subscriptions.db"
+            ),
+            member_catalog_refresh_seconds=_positive_int(
+                "MEMBER_CATALOG_REFRESH_SECONDS", 3600
+            ),
         )
 
 
@@ -204,15 +234,22 @@ def setup_logging() -> None:
 
 class MultiBlogWatcher(discord.Client):
     def __init__(self, config: Config) -> None:
-        super().__init__(intents=discord.Intents.none())
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.message_content = True
+        super().__init__(intents=intents)
         self.config = config
         self.states = {
             source.key: StateStore(source.state_db)
             for source in config.sources
         }
+        self.subscriptions = SubscriptionStore(config.subscription_db)
         self.reactivated_posts = self.states["sakura"].enable_previously_ignored_posts()
         self.http_session: aiohttp.ClientSession | None = None
         self.workers: dict[str, asyncio.Task[None]] = {}
+        self.member_catalogs: dict[str, dict[str, str]] = {}
+        self.member_catalog_fetched_at: dict[str, float] = {}
+        self.member_catalog_lock = asyncio.Lock()
         self.log = logging.getLogger("watcher")
 
     async def setup_hook(self) -> None:
@@ -231,6 +268,11 @@ class MultiBlogWatcher(discord.Client):
                 "櫻坂46 reactivated %s previously ignored homepage item(s)",
                 self.reactivated_posts,
             )
+        if self.config.subscription_channel_id:
+            self.log.info(
+                "Member subscription commands enabled in Discord channel %s",
+                self.config.subscription_channel_id,
+            )
         for source in self.config.sources:
             self.log.info(
                 "%s watcher targets Discord channel %s",
@@ -243,6 +285,193 @@ class MultiBlogWatcher(discord.Client):
                     self.watch_forever(source, self.states[source.key]),
                     name=f"blog-watcher-{source.key}",
                 )
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or message.guild is None:
+            return
+        if (
+            not self.config.subscription_channel_id
+            or message.channel.id != self.config.subscription_channel_id
+        ):
+            return
+        await self.handle_subscription_message(message)
+
+    @staticmethod
+    def source_aliases() -> dict[str, str]:
+        return {
+            "hinata": "hinata",
+            "日向": "hinata",
+            "日向坂": "hinata",
+            "日向坂46": "hinata",
+            "sakura": "sakura",
+            "櫻": "sakura",
+            "櫻坂": "sakura",
+            "櫻坂46": "sakura",
+        }
+
+    def source_for_alias(self, value: str) -> SourceConfig | None:
+        source_key = self.source_aliases().get(_normalize_member_name(value).lower())
+        if source_key is None:
+            return None
+        return next(
+            (source for source in self.config.sources if source.key == source_key),
+            None,
+        )
+
+    async def get_member_catalog(
+        self, source: SourceConfig, *, force: bool = False
+    ) -> dict[str, str]:
+        now = asyncio.get_running_loop().time()
+        cached = self.member_catalogs.get(source.key)
+        fetched_at = self.member_catalog_fetched_at.get(source.key, 0.0)
+        if (
+            cached is not None
+            and not force
+            and now - fetched_at < self.config.member_catalog_refresh_seconds
+        ):
+            return cached
+
+        async with self.member_catalog_lock:
+            now = asyncio.get_running_loop().time()
+            cached = self.member_catalogs.get(source.key)
+            fetched_at = self.member_catalog_fetched_at.get(source.key, 0.0)
+            if (
+                cached is not None
+                and not force
+                and now - fetched_at < self.config.member_catalog_refresh_seconds
+            ):
+                return cached
+            if self.http_session is None:
+                raise RuntimeError("HTTP session is not ready")
+
+            fetcher = BlogIndexFetcher(
+                self.http_session,
+                source.member_index_url,
+                source.name,
+                self.config.timeout,
+                self.config.retries,
+            )
+            html = await fetcher.fetch()
+            names = parse_member_names(html, source.key)
+            if not names:
+                raise RuntimeError(
+                    f"{source.name} official member page contained no members"
+                )
+            catalog = {
+                _member_lookup_key(name): name
+                for name in names
+            }
+            self.member_catalogs[source.key] = catalog
+            self.member_catalog_fetched_at[source.key] = now
+            self.log.info(
+                "%s member catalog refreshed with %s member(s)",
+                source.name,
+                len(catalog),
+            )
+            return catalog
+
+    async def handle_subscription_message(self, message: discord.Message) -> None:
+        parts = message.content.strip().split(maxsplit=2)
+        if not parts:
+            return
+        command = parts[0].lower()
+        subscribe_commands = {"!關注", "!訂閱", "!subscribe", "!sub"}
+        unsubscribe_commands = {
+            "!取消關注",
+            "!取消訂閱",
+            "!取消",
+            "!unsubscribe",
+            "!unsub",
+        }
+        list_commands = {"!我的關注", "!關注清單", "!subscriptions", "!subs"}
+        help_commands = {"!關注說明", "!關注幫助", "!help", "!subscribe-help"}
+
+        if command in help_commands:
+            await message.reply(
+                "可用指令：\n"
+                "`!關注 <日向坂46|櫻坂46> <成員名字>`\n"
+                "`!取消關注 <日向坂46|櫻坂46> <成員名字>`\n"
+                "`!我的關注`",
+                mention_author=False,
+            )
+            return
+        if command in list_commands:
+            rows = self.subscriptions.user_subscriptions(
+                message.guild.id, message.author.id
+            )
+            if not rows:
+                await message.reply("你目前沒有關注任何成員。", mention_author=False)
+                return
+            group_names = {source.key: source.name for source in self.config.sources}
+            content = "\n".join(
+                f"- {group_names.get(group_key, group_key)}：{member_name}"
+                for group_key, member_name in rows
+            )
+            await message.reply(
+                f"你目前的關注清單：\n{content}", mention_author=False
+            )
+            return
+        if command not in subscribe_commands and command not in unsubscribe_commands:
+            return
+
+        if len(parts) != 3:
+            await message.reply(
+                "格式錯誤，請使用：`!關注 <日向坂46|櫻坂46> <成員名字>`",
+                mention_author=False,
+            )
+            return
+
+        source = self.source_for_alias(parts[1])
+        if source is None:
+            await message.reply(
+                "找不到團體，請使用 `日向坂46` 或 `櫻坂46`。",
+                mention_author=False,
+            )
+            return
+
+        try:
+            catalog = await self.get_member_catalog(source)
+        except Exception:
+            self.log.exception("Unable to refresh %s member catalog", source.name)
+            await message.reply(
+                "目前無法讀取官方成員名單，請稍後再試。",
+                mention_author=False,
+            )
+            return
+
+        member_key = _member_lookup_key(parts[2])
+        member_name = catalog.get(member_key)
+        if member_name is None:
+            await message.reply(
+                f"找不到「{parts[2]}」，請確認是{source.name}官方成員名字。",
+                mention_author=False,
+            )
+            return
+
+        if command in subscribe_commands:
+            changed = self.subscriptions.subscribe(
+                message.guild.id,
+                message.author.id,
+                source.key,
+                member_key,
+                member_name,
+            )
+            if changed:
+                response = f"✅ 已成功關注 {source.name}「{member_name}」。"
+            else:
+                response = f"ℹ️ 你已經關注 {source.name}「{member_name}」，不會重複建立。"
+        else:
+            changed = self.subscriptions.unsubscribe(
+                message.guild.id,
+                message.author.id,
+                source.key,
+                member_key,
+            )
+            if changed:
+                response = f"✅ 已取消關注 {source.name}「{member_name}」。"
+            else:
+                response = f"ℹ️ 你目前沒有關注 {source.name}「{member_name}」。"
+        await message.reply(response, mention_author=False)
 
     async def get_target_channel(
         self, source: SourceConfig
@@ -343,7 +572,17 @@ class MultiBlogWatcher(discord.Client):
             return
 
         needs_heading = not state.post_announced(post.post_id)
-        mention_ids = member_mention_ids(source, post.author)
+        mention_id_set = set(member_mention_ids(source, post.author))
+        guild = getattr(channel, "guild", None)
+        if guild is not None:
+            mention_id_set.update(
+                self.subscriptions.subscriber_ids(
+                    guild.id,
+                    source.key,
+                    _member_lookup_key(post.author),
+                )
+            )
+        mention_ids = tuple(sorted(mention_id_set))
         mention_line = " ".join(f"<@{user_id}>" for user_id in mention_ids)
         heading = f"🆕 **[{source.name}] {post.title}**"
         details = " · ".join(part for part in (post.author, post.published_at) if part)
@@ -522,6 +761,7 @@ class MultiBlogWatcher(discord.Client):
             await self.http_session.close()
         for state in self.states.values():
             state.close()
+        self.subscriptions.close()
         await super().close()
 
 

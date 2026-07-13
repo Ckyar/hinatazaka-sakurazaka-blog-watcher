@@ -10,10 +10,12 @@ from blog_watcher import (
     BlogPost,
     BlogImageDownloader,
     StateStore,
+    SubscriptionStore,
     post_directory,
     safe_path_component,
     parse_hinata_blog,
     parse_blog_index,
+    parse_member_names,
     parse_sakura_blog,
 )
 
@@ -57,6 +59,23 @@ SAKURA_BLOG_HTML = """
 </body></html>
 """
 
+HINATA_MEMBER_HTML = """
+<ul class="p-member__list">
+  <li class="p-member__item"><a href="/s/official/artist/14">
+    <div class="c-member__name">小坂 菜緒</div>
+  </a></li>
+  <li class="p-member__item"><a href="/s/official/artist/14">
+    <div class="c-member__name">小坂 菜緒</div>
+  </a></li>
+</ul>
+"""
+
+SAKURA_MEMBER_HTML = """
+<ul><li class="box"><a href="/s/s46/artist/65">
+  <p class="name">的野 美青</p><p class="kana">まとの みお</p>
+</a></li></ul>
+"""
+
 
 class ParserTests(unittest.TestCase):
     def test_extracts_unique_homepage_ids_in_display_order(self):
@@ -66,6 +85,10 @@ class ParserTests(unittest.TestCase):
 
     def test_empty_homepage_has_no_ids(self):
         self.assertEqual(parse_blog_index(""), ())
+
+    def test_extracts_unique_current_member_names_from_official_pages(self):
+        self.assertEqual(parse_member_names(HINATA_MEMBER_HTML, "hinata"), ("小坂 菜緒",))
+        self.assertEqual(parse_member_names(SAKURA_MEMBER_HTML, "sakura"), ("的野 美青",))
 
     def test_extracts_sakura_blog_metadata_and_images(self):
         post = parse_sakura_blog(70124, SAKURA_BLOG_HTML)
@@ -255,6 +278,22 @@ class StateTests(unittest.TestCase):
             self.assertEqual(state.enable_previously_ignored_posts(), 0)
             state.close()
 
+    def test_subscription_store_is_idempotent_and_guild_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+            self.assertTrue(
+                store.subscribe(1, 10, "hinata", "小坂菜緒", "小坂 菜緒")
+            )
+            self.assertFalse(
+                store.subscribe(1, 10, "hinata", "小坂菜緒", "小坂 菜緒")
+            )
+            self.assertEqual(store.subscriber_ids(1, "hinata", "小坂菜緒"), (10,))
+            self.assertEqual(store.subscriber_ids(2, "hinata", "小坂菜緒"), ())
+            self.assertEqual(store.user_subscriptions(1, 10), (("hinata", "小坂 菜緒"),))
+            self.assertTrue(store.unsubscribe(1, 10, "hinata", "小坂菜緒"))
+            self.assertFalse(store.unsubscribe(1, 10, "hinata", "小坂菜緒"))
+            store.close()
+
 
 class MentionNotificationTests(unittest.TestCase):
     def test_only_first_discord_batch_mentions_configured_users(self):
@@ -299,6 +338,85 @@ class MentionNotificationTests(unittest.TestCase):
                 "users", second_call.kwargs["allowed_mentions"].to_dict()
             )
             state.close()
+
+    def test_server_subscriber_is_mentioned_for_matching_group_member(self):
+        environment = ConfigTests._minimum_env()
+        with patch.dict("os.environ", environment, clear=True):
+            source = Config.from_env().sources[0]
+
+        post = BlogPost(
+            post_id=70144,
+            url="https://example.test/70144",
+            title="title",
+            author="小坂菜緒",
+            published_at="2026.7.10 12:00",
+            image_urls=("https://cdn.test/a.jpg",),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = StateStore(Path(directory) / "state.db")
+            subscriptions = SubscriptionStore(Path(directory) / "subscriptions.db")
+            subscriptions.subscribe(55, 99, "hinata", "小坂菜緒", "小坂 菜緒")
+            watcher = object.__new__(HinataWatcher)
+            watcher.log = Mock()
+            watcher.subscriptions = subscriptions
+            channel = SimpleNamespace(
+                guild=SimpleNamespace(id=55), send=AsyncMock()
+            )
+            watcher.get_target_channel = AsyncMock(return_value=channel)
+            watcher.reconcile_discord_history = AsyncMock()
+
+            asyncio.run(watcher.announce(source, state, post))
+
+            call = channel.send.await_args
+            self.assertTrue(call.kwargs["content"].startswith("<@99>\n"))
+            subscriptions.close()
+            state.close()
+
+
+class SubscriptionCommandTests(unittest.TestCase):
+    def test_subscribe_duplicate_unsubscribe_and_list_commands(self):
+        environment = ConfigTests._minimum_env() | {
+            "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+            watcher = object.__new__(HinataWatcher)
+            watcher.config = config
+            watcher.subscriptions = store
+            watcher.get_member_catalog = AsyncMock(
+                return_value={"小坂菜緒": "小坂 菜緒"}
+            )
+            guild = SimpleNamespace(id=1)
+            author = SimpleNamespace(id=10, bot=False)
+            channel = SimpleNamespace(id=config.subscription_channel_id)
+
+            async def run_command(content: str):
+                message = SimpleNamespace(
+                    content=content,
+                    guild=guild,
+                    author=author,
+                    channel=channel,
+                    reply=AsyncMock(),
+                )
+                await watcher.handle_subscription_message(message)
+                return message.reply.await_args.args[0]
+
+            self.assertIn(
+                "已成功關注",
+                asyncio.run(run_command("!關注 日向坂46 小坂菜緒")),
+            )
+            self.assertIn(
+                "已經關注",
+                asyncio.run(run_command("!關注 日向坂46 小坂 菜緒")),
+            )
+            self.assertIn("小坂 菜緒", asyncio.run(run_command("!我的關注")))
+            self.assertIn(
+                "已取消關注",
+                asyncio.run(run_command("!取消關注 日向 小坂菜緒")),
+            )
+            store.close()
 
 
 if __name__ == "__main__":
