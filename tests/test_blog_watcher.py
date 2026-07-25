@@ -5,7 +5,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from app import Config, HinataWatcher, image_batches, member_mention_ids
+from app import (
+    Config,
+    HinataWatcher,
+    image_batches,
+    member_mention_ids,
+    subscription_author_catalog,
+)
 from blog_watcher import (
     BlogPost,
     BlogImageDownloader,
@@ -374,6 +380,13 @@ class MentionNotificationTests(unittest.TestCase):
 
 
 class SubscriptionCommandTests(unittest.TestCase):
+    def test_hinata_catalog_includes_poka_aliases_only_for_hinata(self):
+        hinata = subscription_author_catalog("hinata", ("小坂 菜緒",))
+        self.assertEqual(hinata["ポカ"], "ポカ")
+        self.assertEqual(hinata["ぽか"], "ポカ")
+        self.assertEqual(hinata["poka"], "ポカ")
+        self.assertNotIn("poka", subscription_author_catalog("sakura", ()))
+
     def test_subscribe_duplicate_unsubscribe_and_list_commands(self):
         environment = ConfigTests._minimum_env() | {
             "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
@@ -458,7 +471,7 @@ class SubscriptionCommandTests(unittest.TestCase):
                 )
             )
             self.assertIn("已成功關注：小坂 菜緒、大野 愛実", response)
-            self.assertIn("找不到日向坂46官方成員：不存在成員", response)
+            self.assertIn("找不到日向坂46可訂閱作者：不存在成員", response)
             self.assertEqual(
                 store.user_subscriptions(guild.id, author.id),
                 (("hinata", "大野 愛実"), ("hinata", "小坂 菜緒")),
@@ -470,6 +483,41 @@ class SubscriptionCommandTests(unittest.TestCase):
             self.assertIn("已取消關注：小坂 菜緒、大野 愛実", response)
             self.assertIn("原本沒有關注：正源司 陽子", response)
             self.assertEqual(store.user_subscriptions(guild.id, author.id), ())
+            store.close()
+
+    def test_poka_alias_subscribes_with_canonical_blog_author_key(self):
+        environment = ConfigTests._minimum_env() | {
+            "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+            watcher = object.__new__(HinataWatcher)
+            watcher.config = config
+            watcher.subscriptions = store
+            watcher.get_member_catalog = AsyncMock(
+                return_value=subscription_author_catalog("hinata", ())
+            )
+            guild = SimpleNamespace(id=1)
+            author = SimpleNamespace(id=10, bot=False)
+            channel = SimpleNamespace(id=config.subscription_channel_id)
+
+            async def run_command(content: str):
+                message = SimpleNamespace(
+                    content=content,
+                    guild=guild,
+                    author=author,
+                    channel=channel,
+                    reply=AsyncMock(),
+                )
+                await watcher.handle_subscription_message(message)
+                return message.reply.await_args.args[0]
+
+            response = asyncio.run(run_command("!關注 日向坂46 POKA、ぽか、ポカ"))
+            self.assertIn("已成功關注：ポカ", response)
+            self.assertEqual(store.subscriber_ids(guild.id, "hinata", "ポカ"), (10,))
+            self.assertIn("ポカ", asyncio.run(run_command("!我的關注")))
             store.close()
 
 

@@ -37,6 +37,12 @@ from blog_watcher import (
 
 ROOT = Path(__file__).resolve().parent
 
+SPECIAL_SUBSCRIPTION_AUTHORS: dict[str, dict[str, tuple[str, ...]]] = {
+    "hinata": {
+        "ポカ": ("ぽか", "poka"),
+    },
+}
+
 
 def image_batches(image_urls: list[str], size: int = 10) -> list[list[str]]:
     return [image_urls[index : index + size] for index in range(0, len(image_urls), size)]
@@ -69,7 +75,19 @@ def _normalize_member_name(value: str) -> str:
 
 
 def _member_lookup_key(value: str) -> str:
-    return "".join(_normalize_member_name(value).split())
+    return "".join(_normalize_member_name(value).split()).casefold()
+
+
+def subscription_author_catalog(
+    group_key: str, member_names: tuple[str, ...]
+) -> dict[str, str]:
+    catalog = {_member_lookup_key(name): name for name in member_names}
+    for canonical_name, aliases in SPECIAL_SUBSCRIPTION_AUTHORS.get(
+        group_key, {}
+    ).items():
+        for name in (canonical_name, *aliases):
+            catalog[_member_lookup_key(name)] = canonical_name
+    return catalog
 
 
 def _split_member_names(value: str) -> tuple[str, ...]:
@@ -376,16 +394,13 @@ class MultiBlogWatcher(discord.Client):
                 raise RuntimeError(
                     f"{source.name} official member page contained no members"
                 )
-            catalog = {
-                _member_lookup_key(name): name
-                for name in names
-            }
+            catalog = subscription_author_catalog(source.key, names)
             self.member_catalogs[source.key] = catalog
             self.member_catalog_fetched_at[source.key] = now
             self.log.info(
                 "%s member catalog refreshed with %s member(s)",
                 source.name,
-                len(catalog),
+                len(set(catalog.values())),
             )
             return catalog
 
@@ -411,7 +426,8 @@ class MultiBlogWatcher(discord.Client):
                 "`!關注 <日向坂46|櫻坂46> <成員名字>[、<成員名字>...]`\n"
                 "`!取消關注 <日向坂46|櫻坂46> <成員名字>[、<成員名字>...]`\n"
                 "`!我的關注`\n"
-                "多位成員請用 `、`、逗號、分號或換行分隔。",
+                "多位成員請用 `、`、逗號、分號或換行分隔。\n"
+                "日向坂的 `ポカ` 也可輸入 `ぽか` 或 `Poka`。",
                 mention_author=False,
             )
             return
@@ -471,12 +487,17 @@ class MultiBlogWatcher(discord.Client):
         changed_names: list[str] = []
         unchanged_names: list[str] = []
         unknown_names: list[str] = []
+        processed_member_keys: set[str] = set()
         for requested_name in requested_names:
-            member_key = _member_lookup_key(requested_name)
-            member_name = catalog.get(member_key)
+            requested_key = _member_lookup_key(requested_name)
+            member_name = catalog.get(requested_key)
             if member_name is None:
                 unknown_names.append(requested_name)
                 continue
+            member_key = _member_lookup_key(member_name)
+            if member_key in processed_member_keys:
+                continue
+            processed_member_keys.add(member_key)
 
             if command in subscribe_commands:
                 changed = self.subscriptions.subscribe(
@@ -512,7 +533,7 @@ class MultiBlogWatcher(discord.Client):
                 )
         if unknown_names:
             response_lines.append(
-                f"⚠️ 找不到{source.name}官方成員：{'、'.join(unknown_names)}"
+                f"⚠️ 找不到{source.name}可訂閱作者：{'、'.join(unknown_names)}"
             )
         await message.reply("\n".join(response_lines), mention_author=False)
 
