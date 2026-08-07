@@ -180,6 +180,8 @@ class Config:
     subscription_channel_id: int
     subscription_db: Path
     member_catalog_refresh_seconds: int
+    enable_subscription_gui: bool
+    enable_text_subscription_commands: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -244,6 +246,10 @@ class Config:
             member_catalog_refresh_seconds=_positive_int(
                 "MEMBER_CATALOG_REFRESH_SECONDS", 3600
             ),
+            enable_subscription_gui=_boolean("ENABLE_SUBSCRIPTION_GUI", True),
+            enable_text_subscription_commands=_boolean(
+                "ENABLE_TEXT_SUBSCRIPTION_COMMANDS", True
+            ),
         )
 
 
@@ -265,6 +271,322 @@ def setup_logging() -> None:
     logging.basicConfig(level=level, handlers=[file_handler, console_handler])
 
 
+SUBSCRIPTION_PAGE_SIZE = 20
+SUBSCRIPTION_PANEL_CONTENT = (
+    "## 🌸 部落格關注管理\n"
+    "按下按鈕後，只有你看得到自己的管理畫面。你可以分別選擇日向坂46或"
+    "櫻坂46成員；關注的成員發表部落格時，POKA 會在圖片貼文中標記你。"
+)
+
+
+def _unique_catalog_members(catalog: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    """Return canonical member keys/names once, preserving official page order."""
+    members: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for member_name in catalog.values():
+        member_key = _member_lookup_key(member_name)
+        if member_key in seen:
+            continue
+        seen.add(member_key)
+        members.append((member_key, member_name))
+    return tuple(members)
+
+
+class SubscriptionPanelView(discord.ui.View):
+    """Persistent public entry point; the actual manager is always ephemeral."""
+
+    def __init__(self, watcher: "MultiBlogWatcher") -> None:
+        super().__init__(timeout=None)
+        self.watcher = watcher
+
+    @discord.ui.button(
+        label="管理我的關注",
+        emoji="⚙️",
+        style=discord.ButtonStyle.primary,
+        custom_id="poka:subscriptions:manage:v1",
+    )
+    async def manage(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self.watcher.open_subscription_manager(interaction)
+
+    @discord.ui.button(
+        label="查看目前關注",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="poka:subscriptions:list:v1",
+    )
+    async def show_current(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self.watcher.show_current_subscriptions(interaction)
+
+
+class SubscriptionGroupView(discord.ui.View):
+    def __init__(self, watcher: "MultiBlogWatcher", user_id: int) -> None:
+        super().__init__(timeout=900)
+        self.watcher = watcher
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            "這不是你的關注管理畫面，請從公開面板重新開啟。", ephemeral=True
+        )
+        return False
+
+    async def _open_group(
+        self, interaction: discord.Interaction, group_key: str
+    ) -> None:
+        await interaction.response.defer()
+        try:
+            source = self.watcher.source_for_key(group_key)
+            if source is None:
+                raise RuntimeError(f"Unknown source {group_key}")
+            if interaction.guild_id is None:
+                raise RuntimeError("Subscription GUI requires a Discord server")
+            catalog = await self.watcher.get_member_catalog(source)
+            current_members = _unique_catalog_members(catalog)
+            if not current_members:
+                raise RuntimeError(f"{source.name} catalog is empty")
+            current_member_keys = {member_key for member_key, _ in current_members}
+            previous_subscriptions = (
+                self.watcher.subscriptions.user_group_subscriptions(
+                    interaction.guild_id, self.user_id, source.key
+                )
+            )
+            stale_members = tuple(
+                (member_key, member_name)
+                for member_key, member_name in previous_subscriptions
+                if member_key not in current_member_keys
+            )
+            members = current_members + stale_members
+            view = MemberSubscriptionView(
+                self.watcher,
+                interaction.guild_id,
+                self.user_id,
+                source,
+                members,
+                page=0,
+                stale_keys={member_key for member_key, _ in stale_members},
+            )
+            await interaction.edit_original_response(
+                content=view.render_content(), view=view
+            )
+        except Exception:
+            self.watcher.log.exception("Unable to open subscription GUI for %s", group_key)
+            await interaction.edit_original_response(
+                content="目前無法讀取官方成員名單，請稍後重新開啟管理畫面。",
+                view=None,
+            )
+
+    @discord.ui.button(label="日向坂46", emoji="☀️", style=discord.ButtonStyle.primary)
+    async def hinata(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self._open_group(interaction, "hinata")
+
+    @discord.ui.button(label="櫻坂46", emoji="🌸", style=discord.ButtonStyle.primary)
+    async def sakura(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self._open_group(interaction, "sakura")
+
+
+class MemberSubscriptionSelect(discord.ui.Select):
+    def __init__(self, manager: "MemberSubscriptionView") -> None:
+        self.manager = manager
+        subscribed_keys = manager.subscribed_keys()
+        options = [
+            discord.SelectOption(
+                label=self._option_label(member_key, member_name),
+                value=member_key,
+                default=member_key in subscribed_keys,
+            )
+            for member_key, member_name in manager.page_members
+        ]
+        super().__init__(
+            placeholder="勾選要關注的成員（可複選）",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=0,
+        )
+
+    def _option_label(self, member_key: str, member_name: str) -> str:
+        if member_key in self.manager.stale_keys:
+            return f"{member_name}（已不在目前官方名單）"[:100]
+        if member_name == "ポカ":
+            return "ポカ（Poka）"
+        return member_name[:100]
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.manager.replace_page(interaction, set(self.values))
+
+
+class MemberSubscriptionView(discord.ui.View):
+    def __init__(
+        self,
+        watcher: "MultiBlogWatcher",
+        guild_id: int | None,
+        user_id: int,
+        source: SourceConfig,
+        members: tuple[tuple[str, str], ...],
+        *,
+        page: int,
+        stale_keys: set[str] | None = None,
+    ) -> None:
+        super().__init__(timeout=900)
+        if guild_id is None:
+            raise ValueError("Subscription GUI requires a Discord server")
+        self.watcher = watcher
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.source = source
+        self.members = members
+        self.stale_keys = stale_keys or set()
+        self.page_count = max(
+            1,
+            (len(members) + SUBSCRIPTION_PAGE_SIZE - 1)
+            // SUBSCRIPTION_PAGE_SIZE,
+        )
+        self.page = min(max(page, 0), self.page_count - 1)
+        start = self.page * SUBSCRIPTION_PAGE_SIZE
+        self.page_members = members[start : start + SUBSCRIPTION_PAGE_SIZE]
+        self.add_item(MemberSubscriptionSelect(self))
+        self.previous_page.disabled = self.page == 0
+        self.next_page.disabled = self.page >= self.page_count - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            "這不是你的關注管理畫面，請從公開面板重新開啟。", ephemeral=True
+        )
+        return False
+
+    def subscribed_keys(self) -> set[str]:
+        return {
+            member_key
+            for member_key, _ in self.watcher.subscriptions.user_group_subscriptions(
+                self.guild_id, self.user_id, self.source.key
+            )
+        }
+
+    def render_content(self, notice: str | None = None) -> str:
+        subscribed_count = len(
+            self.watcher.subscriptions.user_group_subscriptions(
+                self.guild_id, self.user_id, self.source.key
+            )
+        )
+        lines = [
+            f"## {self.source.name}關注管理",
+            f"第 {self.page + 1}/{self.page_count} 頁 · 目前共關注 {subscribed_count} 位作者",
+            "勾選完成後送出即會儲存；取消勾選也會立即取消關注。",
+        ]
+        if self.stale_keys:
+            lines.append(
+                "標示為「已不在目前官方名單」的舊關注會保留，取消勾選即可移除。"
+            )
+        if notice:
+            lines.append(notice)
+        return "\n".join(lines)
+
+    def refreshed(self, *, page: int | None = None) -> "MemberSubscriptionView":
+        return MemberSubscriptionView(
+            self.watcher,
+            self.guild_id,
+            self.user_id,
+            self.source,
+            self.members,
+            page=self.page if page is None else page,
+            stale_keys=self.stale_keys,
+        )
+
+    async def replace_page(
+        self, interaction: discord.Interaction, selected_keys: set[str]
+    ) -> None:
+        self.watcher.subscriptions.replace_page_subscriptions(
+            self.guild_id,
+            self.user_id,
+            self.source.key,
+            self.page_members,
+            selected_keys,
+        )
+        view = self.refreshed()
+        await interaction.response.edit_message(
+            content=view.render_content("✅ 這一頁的關注設定已儲存。"), view=view
+        )
+
+    @discord.ui.button(
+        label="上一頁", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def previous_page(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        view = self.refreshed(page=self.page - 1)
+        await interaction.response.edit_message(content=view.render_content(), view=view)
+
+    @discord.ui.button(
+        label="下一頁", emoji="➡️", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def next_page(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        view = self.refreshed(page=self.page + 1)
+        await interaction.response.edit_message(content=view.render_content(), view=view)
+
+    @discord.ui.button(
+        label="清除此頁", emoji="🗑️", style=discord.ButtonStyle.danger, row=1
+    )
+    async def clear_page(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            content=(
+                f"確定要取消{self.source.name}第 {self.page + 1} 頁的所有關注嗎？"
+                "其他頁與另一團不會受影響。"
+            ),
+            view=ClearPageConfirmationView(self),
+        )
+
+    @discord.ui.button(
+        label="返回團體", emoji="↩️", style=discord.ButtonStyle.secondary, row=1
+    )
+    async def back(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            content="請選擇要管理的團體：",
+            view=SubscriptionGroupView(self.watcher, self.user_id),
+        )
+
+
+class ClearPageConfirmationView(discord.ui.View):
+    def __init__(self, manager: MemberSubscriptionView) -> None:
+        super().__init__(timeout=120)
+        self.manager = manager
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.manager.interaction_check(interaction)
+
+    @discord.ui.button(label="確定清除此頁", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self.manager.replace_page(interaction, set())
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        view = self.manager.refreshed()
+        await interaction.response.edit_message(
+            content=view.render_content("已取消清除。"), view=view
+        )
+
+
 class MultiBlogWatcher(discord.Client):
     def __init__(self, config: Config) -> None:
         intents = discord.Intents.none()
@@ -273,7 +595,10 @@ class MultiBlogWatcher(discord.Client):
         # message_content intent only exposes the text fields; it does not
         # subscribe the client to guild message events by itself.
         intents.guild_messages = True
-        intents.message_content = True
+        intents.message_content = bool(
+            config.subscription_channel_id
+            and config.enable_text_subscription_commands
+        )
         super().__init__(intents=intents)
         self.config = config
         self.states = {
@@ -287,12 +612,18 @@ class MultiBlogWatcher(discord.Client):
         self.member_catalogs: dict[str, dict[str, str]] = {}
         self.member_catalog_fetched_at: dict[str, float] = {}
         self.member_catalog_lock = asyncio.Lock()
+        self.subscription_panel_lock = asyncio.Lock()
         self.log = logging.getLogger("watcher")
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession(
             headers={"User-Agent": self.config.user_agent}
         )
+        if (
+            self.config.subscription_channel_id
+            and self.config.enable_subscription_gui
+        ):
+            self.add_view(SubscriptionPanelView(self))
 
     async def on_ready(self) -> None:
         self.log.info("Discord connected as %s", self.user)
@@ -306,8 +637,20 @@ class MultiBlogWatcher(discord.Client):
                 self.reactivated_posts,
             )
         if self.config.subscription_channel_id:
+            if self.config.enable_subscription_gui:
+                try:
+                    await self.ensure_subscription_panel()
+                except Exception:
+                    self.log.exception("Unable to create or restore subscription GUI panel")
             self.log.info(
-                "Member subscription commands enabled in Discord channel %s",
+                "Member subscription GUI is %s; text commands are %s in Discord "
+                "channel %s",
+                "enabled" if self.config.enable_subscription_gui else "disabled",
+                (
+                    "enabled"
+                    if self.config.enable_text_subscription_commands
+                    else "disabled"
+                ),
                 self.config.subscription_channel_id,
             )
         for source in self.config.sources:
@@ -324,7 +667,11 @@ class MultiBlogWatcher(discord.Client):
                 )
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or message.guild is None:
+        if (
+            message.author.bot
+            or message.guild is None
+            or not self.config.enable_text_subscription_commands
+        ):
             return
         if (
             not self.config.subscription_channel_id
@@ -354,6 +701,106 @@ class MultiBlogWatcher(discord.Client):
             (source for source in self.config.sources if source.key == source_key),
             None,
         )
+
+    def source_for_key(self, group_key: str) -> SourceConfig | None:
+        return next(
+            (source for source in self.config.sources if source.key == group_key),
+            None,
+        )
+
+    def _subscription_panel_setting_key(self) -> str:
+        return f"subscription_panel_message_id:{self.config.subscription_channel_id}"
+
+    async def ensure_subscription_panel(self) -> None:
+        """Restore the single public panel, or create it if it was deleted."""
+        async with self.subscription_panel_lock:
+            channel_id = self.config.subscription_channel_id
+            if not channel_id or not self.config.enable_subscription_gui:
+                return
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(channel_id)
+            if not hasattr(channel, "send") or not hasattr(channel, "fetch_message"):
+                raise RuntimeError(
+                    f"訂閱頻道 ID {channel_id} 不是可傳送及讀取訊息的頻道"
+                )
+
+            setting_key = self._subscription_panel_setting_key()
+            stored_message_id = self.subscriptions.get_setting(setting_key)
+            if stored_message_id and stored_message_id.isdigit():
+                try:
+                    panel_message = await channel.fetch_message(int(stored_message_id))
+                    if self.user is not None and panel_message.author.id == self.user.id:
+                        await panel_message.edit(
+                            content=SUBSCRIPTION_PANEL_CONTENT,
+                            view=SubscriptionPanelView(self),
+                        )
+                        self.log.info(
+                            "Subscription GUI panel restored from message %s",
+                            panel_message.id,
+                        )
+                        return
+                    self.log.warning(
+                        "Stored subscription panel message %s is not owned by this bot; "
+                        "creating a replacement",
+                        stored_message_id,
+                    )
+                except discord.NotFound:
+                    self.log.info(
+                        "Stored subscription panel message %s was deleted; creating a "
+                        "replacement",
+                        stored_message_id,
+                    )
+                self.subscriptions.delete_setting(setting_key)
+            elif stored_message_id:
+                self.subscriptions.delete_setting(setting_key)
+
+            panel_message = await channel.send(
+                SUBSCRIPTION_PANEL_CONTENT,
+                view=SubscriptionPanelView(self),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            self.subscriptions.set_setting(setting_key, str(panel_message.id))
+            self.log.info(
+                "Subscription GUI panel created as message %s in channel %s",
+                panel_message.id,
+                channel_id,
+            )
+
+    async def open_subscription_manager(
+        self, interaction: discord.Interaction
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "關注功能只能在 Discord 伺服器內使用。", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "請選擇要管理的團體：",
+            view=SubscriptionGroupView(self, interaction.user.id),
+            ephemeral=True,
+        )
+
+    async def show_current_subscriptions(
+        self, interaction: discord.Interaction
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "關注功能只能在 Discord 伺服器內使用。", ephemeral=True
+            )
+            return
+        rows = self.subscriptions.user_subscriptions(
+            interaction.guild_id, interaction.user.id
+        )
+        if not rows:
+            content = "你目前沒有關注任何成員。"
+        else:
+            group_names = {source.key: source.name for source in self.config.sources}
+            content = "## 你目前的關注清單\n" + "\n".join(
+                f"- {group_names.get(group_key, group_key)}：{member_name}"
+                for group_key, member_name in rows
+            )
+        await interaction.response.send_message(content, ephemeral=True)
 
     async def get_member_catalog(
         self, source: SourceConfig, *, force: bool = False

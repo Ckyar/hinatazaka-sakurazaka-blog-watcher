@@ -307,6 +307,10 @@ class SubscriptionStore:
             );
             CREATE INDEX IF NOT EXISTS subscriptions_lookup
                 ON subscriptions(guild_id, group_key, member_key);
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         self.connection.commit()
@@ -360,6 +364,77 @@ class SubscriptionStore:
             (guild_id, user_id),
         ).fetchall()
         return tuple((str(row[0]), str(row[1])) for row in rows)
+
+    def user_group_subscriptions(
+        self, guild_id: int, user_id: int, group_key: str
+    ) -> tuple[tuple[str, str], ...]:
+        rows = self.connection.execute(
+            "SELECT member_key, member_name FROM subscriptions "
+            "WHERE guild_id = ? AND user_id = ? AND group_key = ? "
+            "ORDER BY member_name",
+            (guild_id, user_id, group_key),
+        ).fetchall()
+        return tuple((str(row[0]), str(row[1])) for row in rows)
+
+    def replace_page_subscriptions(
+        self,
+        guild_id: int,
+        user_id: int,
+        group_key: str,
+        page_members: tuple[tuple[str, str], ...],
+        selected_member_keys: set[str],
+    ) -> None:
+        """Replace one GUI page atomically without affecting other pages/groups."""
+        page_member_map = dict(page_members)
+        invalid_keys = selected_member_keys.difference(page_member_map)
+        if invalid_keys:
+            raise ValueError("selected_member_keys contains members outside this page")
+        if not page_members:
+            return
+
+        placeholders = ",".join("?" for _ in page_members)
+        page_keys = tuple(page_member_map)
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM subscriptions "
+                "WHERE guild_id = ? AND user_id = ? AND group_key = ? "
+                f"AND member_key IN ({placeholders})",
+                (guild_id, user_id, group_key, *page_keys),
+            )
+            self.connection.executemany(
+                "INSERT INTO subscriptions "
+                "(guild_id, user_id, group_key, member_key, member_name) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    (
+                        guild_id,
+                        user_id,
+                        group_key,
+                        member_key,
+                        page_member_map[member_key],
+                    )
+                    for member_key in page_keys
+                    if member_key in selected_member_keys
+                ),
+            )
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT value FROM bot_settings WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.connection.execute(
+            "INSERT INTO bot_settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self.connection.commit()
+
+    def delete_setting(self, key: str) -> None:
+        self.connection.execute("DELETE FROM bot_settings WHERE key = ?", (key,))
+        self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()

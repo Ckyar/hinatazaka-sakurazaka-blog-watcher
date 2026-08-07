@@ -5,9 +5,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import discord
+
 from app import (
     Config,
     HinataWatcher,
+    MemberSubscriptionView,
+    SUBSCRIPTION_PAGE_SIZE,
+    SubscriptionPanelView,
+    _unique_catalog_members,
     image_batches,
     member_mention_ids,
     subscription_author_catalog,
@@ -192,6 +198,21 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SAVE_IMAGES_LOCALLY"):
                 Config.from_env()
 
+    def test_subscription_gui_defaults_on_and_text_commands_can_be_disabled(self):
+        with patch.dict("os.environ", self._minimum_env(), clear=True):
+            config = Config.from_env()
+        self.assertTrue(config.enable_subscription_gui)
+        self.assertTrue(config.enable_text_subscription_commands)
+
+        environment = self._minimum_env() | {
+            "ENABLE_SUBSCRIPTION_GUI": "false",
+            "ENABLE_TEXT_SUBSCRIPTION_COMMANDS": "false",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+        self.assertFalse(config.enable_subscription_gui)
+        self.assertFalse(config.enable_text_subscription_commands)
+
     def test_disabled_storage_does_not_create_image_downloader(self):
         environment = self._minimum_env() | {"SAVE_IMAGES_LOCALLY": "false"}
         with patch.dict("os.environ", environment, clear=True):
@@ -299,6 +320,190 @@ class StateTests(unittest.TestCase):
             self.assertTrue(store.unsubscribe(1, 10, "hinata", "小坂菜緒"))
             self.assertFalse(store.unsubscribe(1, 10, "hinata", "小坂菜緒"))
             store.close()
+
+    def test_gui_page_replace_preserves_other_pages_groups_and_users(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+            store.subscribe(1, 10, "hinata", "member-a", "Member A")
+            store.subscribe(1, 10, "hinata", "member-c", "Member C")
+            store.subscribe(1, 10, "sakura", "member-s", "Member S")
+            store.subscribe(1, 11, "hinata", "member-a", "Member A")
+
+            store.replace_page_subscriptions(
+                1,
+                10,
+                "hinata",
+                (("member-a", "Member A"), ("member-b", "Member B")),
+                {"member-b"},
+            )
+
+            self.assertEqual(
+                store.user_group_subscriptions(1, 10, "hinata"),
+                (("member-b", "Member B"), ("member-c", "Member C")),
+            )
+            self.assertEqual(
+                store.user_group_subscriptions(1, 10, "sakura"),
+                (("member-s", "Member S"),),
+            )
+            self.assertEqual(
+                store.user_group_subscriptions(1, 11, "hinata"),
+                (("member-a", "Member A"),),
+            )
+            with self.assertRaisesRegex(ValueError, "outside this page"):
+                store.replace_page_subscriptions(
+                    1, 10, "hinata", (("member-a", "Member A"),), {"member-z"}
+                )
+            store.close()
+
+    def test_subscription_panel_setting_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "subscriptions.db"
+            store = SubscriptionStore(path)
+            self.assertIsNone(store.get_setting("panel"))
+            store.set_setting("panel", "123")
+            store.close()
+
+            reopened = SubscriptionStore(path)
+            self.assertEqual(reopened.get_setting("panel"), "123")
+            reopened.delete_setting("panel")
+            self.assertIsNone(reopened.get_setting("panel"))
+            reopened.close()
+
+
+class SubscriptionGuiTests(unittest.TestCase):
+    def test_panel_creation_is_recorded_and_restored_without_duplication(self):
+        environment = ConfigTests._minimum_env() | {
+            "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+
+            async def check_panel():
+                created_message = SimpleNamespace(id=321)
+                channel = SimpleNamespace(
+                    send=AsyncMock(return_value=created_message),
+                    fetch_message=AsyncMock(),
+                )
+                watcher = SimpleNamespace(
+                    config=config,
+                    subscription_panel_lock=asyncio.Lock(),
+                    subscriptions=store,
+                    get_channel=lambda _: channel,
+                    fetch_channel=AsyncMock(),
+                    user=SimpleNamespace(id=99),
+                    log=Mock(),
+                    _subscription_panel_setting_key=lambda: "panel",
+                )
+
+                await HinataWatcher.ensure_subscription_panel(watcher)
+                self.assertEqual(store.get_setting("panel"), "321")
+                channel.send.assert_awaited_once()
+
+                restored_message = SimpleNamespace(
+                    id=321,
+                    author=SimpleNamespace(id=99),
+                    edit=AsyncMock(),
+                )
+                channel.fetch_message.return_value = restored_message
+                channel.send.reset_mock()
+                await HinataWatcher.ensure_subscription_panel(watcher)
+                restored_message.edit.assert_awaited_once()
+                channel.send.assert_not_awaited()
+
+            try:
+                asyncio.run(check_panel())
+            finally:
+                store.close()
+
+    def test_public_panel_is_persistent(self):
+        async def build_view():
+            view = SubscriptionPanelView(SimpleNamespace())
+            self.assertIsNone(view.timeout)
+            self.assertTrue(view.is_persistent())
+            self.assertEqual(
+                {item.custom_id for item in view.children},
+                {
+                    "poka:subscriptions:manage:v1",
+                    "poka:subscriptions:list:v1",
+                },
+            )
+            view.stop()
+
+        asyncio.run(build_view())
+
+    def test_member_gui_paginates_and_preselects_existing_subscriptions(self):
+        environment = ConfigTests._minimum_env()
+        with patch.dict("os.environ", environment, clear=True):
+            source = Config.from_env().sources[0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+            names = tuple(f"Member {index:02d}" for index in range(21))
+            catalog = subscription_author_catalog("hinata", names)
+            members = _unique_catalog_members(catalog)
+            self.assertEqual(len(members), 22)
+            gui_members = members + (("formermember", "Former Member"),)
+            store.subscribe(1, 10, "hinata", "member00", "Member 00")
+            store.subscribe(1, 10, "hinata", "ポカ", "ポカ")
+            store.subscribe(1, 10, "hinata", "formermember", "Former Member")
+            watcher = SimpleNamespace(subscriptions=store)
+
+            async def check_views():
+                first = MemberSubscriptionView(
+                    watcher,
+                    1,
+                    10,
+                    source,
+                    gui_members,
+                    page=0,
+                    stale_keys={"formermember"},
+                )
+                first_select = next(
+                    item for item in first.children if isinstance(item, discord.ui.Select)
+                )
+                self.assertEqual(len(first_select.options), SUBSCRIPTION_PAGE_SIZE)
+                self.assertEqual(first_select.max_values, SUBSCRIPTION_PAGE_SIZE)
+                component_rows = first.to_components()
+                self.assertEqual([row["type"] for row in component_rows], [1, 1])
+                self.assertEqual(component_rows[0]["components"][0]["type"], 3)
+                self.assertEqual(len(component_rows[1]["components"]), 4)
+                self.assertTrue(first_select.options[0].default)
+                self.assertTrue(first.previous_page.disabled)
+                self.assertFalse(first.next_page.disabled)
+
+                second = MemberSubscriptionView(
+                    watcher,
+                    1,
+                    10,
+                    source,
+                    gui_members,
+                    page=1,
+                    stale_keys={"formermember"},
+                )
+                second_select = next(
+                    item for item in second.children if isinstance(item, discord.ui.Select)
+                )
+                self.assertEqual(len(second_select.options), 3)
+                poka = next(option for option in second_select.options if option.value == "ポカ")
+                self.assertEqual(poka.label, "ポカ（Poka）")
+                self.assertTrue(poka.default)
+                former = next(
+                    option
+                    for option in second_select.options
+                    if option.value == "formermember"
+                )
+                self.assertIn("已不在目前官方名單", former.label)
+                self.assertTrue(former.default)
+                self.assertFalse(second.previous_page.disabled)
+                self.assertTrue(second.next_page.disabled)
+                first.stop()
+                second.stop()
+
+            try:
+                asyncio.run(check_views())
+            finally:
+                store.close()
 
 
 class MentionNotificationTests(unittest.TestCase):

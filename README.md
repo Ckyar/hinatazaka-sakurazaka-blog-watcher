@@ -9,7 +9,7 @@
 - 可選擇將圖片分類儲存在 `images/成員名字/日期_部落格標題_ID/`；停用本機儲存時仍會將官方圖片網址傳送至 Discord。
 - 每篇文章把標題、連結及最多 10 張圖片合併在同一則 Discord 訊息；超過 10 張時依 Discord 限制自動分批。
 - SQLite 保存掃描進度、已公告文章與已傳送圖片；程式重啟後會續跑且不重複傳送。
-- 可在同一伺服器的訂閱頻道使用 `!關注`、`!取消關注` 與 `!我的關注`，依成員姓名訂閱兩團部落格；該成員發文時只 Tag 同伺服器的訂閱者。
+- 可在同一伺服器的關注頻道用按鈕與複選選單管理兩團成員；也可保留 `!關注` 等文字指令。該成員發文時只 Tag 同伺服器的訂閱者。
 - 成員名單從兩團官方成員頁讀取並定期更新，輸入姓名時會忽略姓與名之間的空白。
 - HTTP 暫時錯誤會重試，Discord 失敗時保留原編號供下次再試。
 - 記錄檔自動輪替，適合長時間運作。
@@ -23,11 +23,11 @@
    - Send Messages
    - Embed Links
    - Read Message History
-   - 訂閱頻道也必須允許一般成員 Send Messages；部落格通知頻道則可依需求將一般成員設為唯讀。
+   - 一般成員使用 GUI 時不需要 Send Messages，關注頻道可設為唯讀。
 4. 用產生的網址邀請 Bot 進伺服器。
 5. Discord 設定中開啟「開發者模式」，右鍵點目標頻道 →「複製頻道 ID」。
 
-若要啟用成員訂閱指令，請在 **Bot → Privileged Gateway Intents** 開啟 **Message Content Intent**；程式只處理 `.env` 指定的訂閱頻道，其他頻道訊息不會被當作指令。
+只有保留 `!關注` 等文字指令時，才需要在 **Bot → Privileged Gateway Intents** 開啟 **Message Content Intent**。若 `.env` 設為 `ENABLE_TEXT_SUBSCRIPTION_COMMANDS=false`，GUI 不使用訊息內容，因此可以關閉這項 Intent。
 
 程式會以兩層方式避免重傳：首先查詢各團獨立的 SQLite；若本地紀錄不完整，再檢查對應 Discord 頻道歷史，只比對 Bot 自己送出的文章與圖片網址。`DISCORD_HISTORY_LIMIT` 預設為 500，可在 `.env` 調整。若沒有 Read Message History 權限，仍會使用本地 SQLite 去重。
 
@@ -54,11 +54,29 @@ SAKURA_MEMBER_MENTIONS={"的野 美青":["444444444444444444"]}
 
 ```dotenv
 SUBSCRIPTION_CHANNEL_ID=訂閱頻道ID
+ENABLE_SUBSCRIPTION_GUI=true
+ENABLE_TEXT_SUBSCRIPTION_COMMANDS=true
 SUBSCRIPTION_DB=data/subscriptions.db
 MEMBER_CATALOG_REFRESH_SECONDS=3600
 ```
 
-訂閱頻道的 `@everyone` 必須允許 View Channel、Send Messages；Bot 需要 View Channel、Send Messages 與 Read Message History。這個頻道不能套用部落格通知頻道的唯讀規則。
+Bot 啟動後會在指定頻道建立一則「部落格關注管理」面板。使用者按「管理我的關注」，再選擇日向坂46或櫻坂46，即可用複選選單勾選成員；每頁最多 20 位，既有關注會預先勾選。每次送出只更新當頁，不會影響其他頁、另一團或其他使用者。`ポカ（Poka）` 會列在日向坂選單中。若既有關注已不在目前官方名單，GUI 會保留並標示，讓使用者自行取消。「查看目前關注」只會以私人畫面顯示給按按鈕的人。
+
+建議頻道權限如下：
+
+- `@everyone`：允許 View Channel、Read Message History，拒絕 Send Messages，讓頻道保持唯讀但仍可按按鈕。
+- Bot：允許 View Channel、Send Messages、Read Message History；通知圖片頻道另需 Embed Links。
+- 不需要 Manage Messages。程式不會自動置頂面板；管理員可在 Discord 手動置頂。
+
+面板訊息 ID 會存進 `SUBSCRIPTION_DB`。Bot 重啟時會恢復按鈕；若面板已被刪除，下次啟動會自動建立新的面板。既有文字指令訂閱與 GUI 使用相同資料庫，會直接顯示為已勾選，不需要轉換資料。
+
+若想完全改用 GUI，可在確認運作正常後設定：
+
+```dotenv
+ENABLE_TEXT_SUBSCRIPTION_COMMANDS=false
+```
+
+以下文字指令預設仍保留作為備援：
 
 可用指令：
 
