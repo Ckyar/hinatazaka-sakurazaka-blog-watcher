@@ -182,6 +182,7 @@ class Config:
     member_catalog_refresh_seconds: int
     enable_subscription_gui: bool
     enable_text_subscription_commands: bool
+    pin_subscription_panel: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -250,6 +251,7 @@ class Config:
             enable_text_subscription_commands=_boolean(
                 "ENABLE_TEXT_SUBSCRIPTION_COMMANDS", True
             ),
+            pin_subscription_panel=_boolean("PIN_SUBSCRIPTION_PANEL", True),
         )
 
 
@@ -323,18 +325,11 @@ class SubscriptionPanelView(discord.ui.View):
 
 
 class SubscriptionGroupView(discord.ui.View):
-    def __init__(self, watcher: "MultiBlogWatcher", user_id: int) -> None:
-        super().__init__(timeout=900)
-        self.watcher = watcher
-        self.user_id = user_id
+    """Stateless persistent selector so an idle private menu remains usable."""
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.user_id:
-            return True
-        await interaction.response.send_message(
-            "這不是你的關注管理畫面，請從公開面板重新開啟。", ephemeral=True
-        )
-        return False
+    def __init__(self, watcher: "MultiBlogWatcher") -> None:
+        super().__init__(timeout=None)
+        self.watcher = watcher
 
     async def _open_group(
         self, interaction: discord.Interaction, group_key: str
@@ -353,7 +348,7 @@ class SubscriptionGroupView(discord.ui.View):
             current_member_keys = {member_key for member_key, _ in current_members}
             previous_subscriptions = (
                 self.watcher.subscriptions.user_group_subscriptions(
-                    interaction.guild_id, self.user_id, source.key
+                    interaction.guild_id, interaction.user.id, source.key
                 )
             )
             stale_members = tuple(
@@ -365,7 +360,7 @@ class SubscriptionGroupView(discord.ui.View):
             view = MemberSubscriptionView(
                 self.watcher,
                 interaction.guild_id,
-                self.user_id,
+                interaction.user.id,
                 source,
                 members,
                 page=0,
@@ -381,13 +376,23 @@ class SubscriptionGroupView(discord.ui.View):
                 view=None,
             )
 
-    @discord.ui.button(label="日向坂46", emoji="☀️", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="日向坂46",
+        emoji="☀️",
+        style=discord.ButtonStyle.primary,
+        custom_id="poka:subscriptions:group:hinata:v1",
+    )
     async def hinata(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
         await self._open_group(interaction, "hinata")
 
-    @discord.ui.button(label="櫻坂46", emoji="🌸", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="櫻坂46",
+        emoji="🌸",
+        style=discord.ButtonStyle.primary,
+        custom_id="poka:subscriptions:group:sakura:v1",
+    )
     async def sakura(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
@@ -559,7 +564,7 @@ class MemberSubscriptionView(discord.ui.View):
     ) -> None:
         await interaction.response.edit_message(
             content="請選擇要管理的團體：",
-            view=SubscriptionGroupView(self.watcher, self.user_id),
+            view=SubscriptionGroupView(self.watcher),
         )
 
 
@@ -624,6 +629,7 @@ class MultiBlogWatcher(discord.Client):
             and self.config.enable_subscription_gui
         ):
             self.add_view(SubscriptionPanelView(self))
+            self.add_view(SubscriptionGroupView(self))
 
     async def on_ready(self) -> None:
         self.log.info("Discord connected as %s", self.user)
@@ -711,6 +717,24 @@ class MultiBlogWatcher(discord.Client):
     def _subscription_panel_setting_key(self) -> str:
         return f"subscription_panel_message_id:{self.config.subscription_channel_id}"
 
+    async def pin_subscription_panel(self, panel_message: discord.Message) -> None:
+        if not self.config.pin_subscription_panel or panel_message.pinned:
+            return
+        try:
+            await panel_message.pin(reason="Keep the blog subscription panel easy to find")
+            self.log.info("Subscription GUI panel %s pinned", panel_message.id)
+        except discord.Forbidden:
+            self.log.warning(
+                "Unable to pin subscription GUI panel %s; grant Manage Messages "
+                "in subscription channel %s",
+                panel_message.id,
+                self.config.subscription_channel_id,
+            )
+        except discord.HTTPException:
+            self.log.exception(
+                "Discord failed to pin subscription GUI panel %s", panel_message.id
+            )
+
     async def ensure_subscription_panel(self) -> None:
         """Restore the single public panel, or create it if it was deleted."""
         async with self.subscription_panel_lock:
@@ -735,6 +759,7 @@ class MultiBlogWatcher(discord.Client):
                             content=SUBSCRIPTION_PANEL_CONTENT,
                             view=SubscriptionPanelView(self),
                         )
+                        await self.pin_subscription_panel(panel_message)
                         self.log.info(
                             "Subscription GUI panel restored from message %s",
                             panel_message.id,
@@ -761,6 +786,7 @@ class MultiBlogWatcher(discord.Client):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             self.subscriptions.set_setting(setting_key, str(panel_message.id))
+            await self.pin_subscription_panel(panel_message)
             self.log.info(
                 "Subscription GUI panel created as message %s in channel %s",
                 panel_message.id,
@@ -777,7 +803,7 @@ class MultiBlogWatcher(discord.Client):
             return
         await interaction.response.send_message(
             "請選擇要管理的團體：",
-            view=SubscriptionGroupView(self, interaction.user.id),
+            view=SubscriptionGroupView(self),
             ephemeral=True,
         )
 

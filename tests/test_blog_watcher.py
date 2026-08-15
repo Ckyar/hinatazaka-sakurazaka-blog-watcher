@@ -12,6 +12,7 @@ from app import (
     HinataWatcher,
     MemberSubscriptionView,
     SUBSCRIPTION_PAGE_SIZE,
+    SubscriptionGroupView,
     SubscriptionPanelView,
     _unique_catalog_members,
     image_batches,
@@ -203,15 +204,18 @@ class ConfigTests(unittest.TestCase):
             config = Config.from_env()
         self.assertTrue(config.enable_subscription_gui)
         self.assertTrue(config.enable_text_subscription_commands)
+        self.assertTrue(config.pin_subscription_panel)
 
         environment = self._minimum_env() | {
             "ENABLE_SUBSCRIPTION_GUI": "false",
             "ENABLE_TEXT_SUBSCRIPTION_COMMANDS": "false",
+            "PIN_SUBSCRIPTION_PANEL": "false",
         }
         with patch.dict("os.environ", environment, clear=True):
             config = Config.from_env()
         self.assertFalse(config.enable_subscription_gui)
         self.assertFalse(config.enable_text_subscription_commands)
+        self.assertFalse(config.pin_subscription_panel)
 
     def test_disabled_storage_does_not_create_image_downloader(self):
         environment = self._minimum_env() | {"SAVE_IMAGES_LOCALLY": "false"}
@@ -395,6 +399,7 @@ class SubscriptionGuiTests(unittest.TestCase):
                     user=SimpleNamespace(id=99),
                     log=Mock(),
                     _subscription_panel_setting_key=lambda: "panel",
+                    pin_subscription_panel=AsyncMock(),
                 )
 
                 await HinataWatcher.ensure_subscription_panel(watcher)
@@ -411,6 +416,7 @@ class SubscriptionGuiTests(unittest.TestCase):
                 await HinataWatcher.ensure_subscription_panel(watcher)
                 restored_message.edit.assert_awaited_once()
                 channel.send.assert_not_awaited()
+                self.assertEqual(watcher.pin_subscription_panel.await_count, 2)
 
             try:
                 asyncio.run(check_panel())
@@ -432,6 +438,37 @@ class SubscriptionGuiTests(unittest.TestCase):
             view.stop()
 
         asyncio.run(build_view())
+
+    def test_group_selector_remains_persistent_after_idle(self):
+        async def build_view():
+            view = SubscriptionGroupView(SimpleNamespace())
+            self.assertIsNone(view.timeout)
+            self.assertTrue(view.is_persistent())
+            self.assertEqual(
+                {item.custom_id for item in view.children},
+                {
+                    "poka:subscriptions:group:hinata:v1",
+                    "poka:subscriptions:group:sakura:v1",
+                },
+            )
+            view.stop()
+
+        asyncio.run(build_view())
+
+    def test_panel_is_pinned_when_enabled(self):
+        environment = ConfigTests._minimum_env() | {
+            "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+
+        async def pin_panel():
+            message = SimpleNamespace(id=321, pinned=False, pin=AsyncMock())
+            watcher = SimpleNamespace(config=config, log=Mock())
+            await HinataWatcher.pin_subscription_panel(watcher, message)
+            message.pin.assert_awaited_once()
+
+        asyncio.run(pin_panel())
 
     def test_member_gui_paginates_and_preselects_existing_subscriptions(self):
         environment = ConfigTests._minimum_env()

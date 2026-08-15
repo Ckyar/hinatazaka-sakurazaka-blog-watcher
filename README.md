@@ -23,6 +23,7 @@
    - Send Messages
    - Embed Links
    - Read Message History
+   - Manage Messages（僅自動釘選關注管理面板時需要）
    - 一般成員使用 GUI 時不需要 Send Messages，關注頻道可設為唯讀。
 4. 用產生的網址邀請 Bot 進伺服器。
 5. Discord 設定中開啟「開發者模式」，右鍵點目標頻道 →「複製頻道 ID」。
@@ -55,6 +56,7 @@ SAKURA_MEMBER_MENTIONS={"的野 美青":["444444444444444444"]}
 ```dotenv
 SUBSCRIPTION_CHANNEL_ID=訂閱頻道ID
 ENABLE_SUBSCRIPTION_GUI=true
+PIN_SUBSCRIPTION_PANEL=true
 ENABLE_TEXT_SUBSCRIPTION_COMMANDS=true
 SUBSCRIPTION_DB=data/subscriptions.db
 MEMBER_CATALOG_REFRESH_SECONDS=3600
@@ -65,10 +67,10 @@ Bot 啟動後會在指定頻道建立一則「部落格關注管理」面板。�
 建議頻道權限如下：
 
 - `@everyone`：允許 View Channel、Read Message History，拒絕 Send Messages，讓頻道保持唯讀但仍可按按鈕。
-- Bot：允許 View Channel、Send Messages、Read Message History；通知圖片頻道另需 Embed Links。
-- 不需要 Manage Messages。程式不會自動置頂面板；管理員可在 Discord 手動置頂。
+- Bot：允許 View Channel、Send Messages、Read Message History、Manage Messages；通知圖片頻道另需 Embed Links。
+- `PIN_SUBSCRIPTION_PANEL=true` 時會自動釘選管理面板，方便從頻道的「釘選訊息」直接開啟。若設為 `false`，便不需要 Manage Messages，也可由管理員手動釘選。
 
-面板訊息 ID 會存進 `SUBSCRIPTION_DB`。Bot 重啟時會恢復按鈕；若面板已被刪除，下次啟動會自動建立新的面板。既有文字指令訂閱與 GUI 使用相同資料庫，會直接顯示為已勾選，不需要轉換資料。
+面板訊息 ID 會存進 `SUBSCRIPTION_DB`。Bot 重啟時會恢復並確認釘選；若面板已被刪除，下次啟動會自動建立新的面板。「選擇要管理的團體」使用持久化按鈕，長時間沒有操作後仍可繼續選擇。既有文字指令訂閱與 GUI 使用相同資料庫，會直接顯示為已勾選，不需要轉換資料。
 
 若想完全改用 GUI，可在確認運作正常後設定：
 
