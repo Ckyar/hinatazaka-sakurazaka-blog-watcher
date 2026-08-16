@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
@@ -33,6 +34,20 @@ from blog_watcher import (
     parse_blog_index,
     parse_member_names,
     parse_sakura_blog,
+)
+from toyoko_watcher import (
+    JAPAN_PREFECTURE_REGIONS,
+    SMOKING_LABELS,
+    ToyokoAvailabilityResult,
+    ToyokoClient,
+    ToyokoHTTPError,
+    ToyokoRule,
+    ToyokoStore,
+    build_toyoko_search_url,
+    japan_today,
+    parse_interval_minutes,
+    parse_toyoko_search_url,
+    should_notify_availability,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -161,6 +176,7 @@ class SourceConfig:
     state_db: Path
     image_dir: Path
     member_mentions: dict[str, tuple[int, ...]]
+    enabled: bool
 
 
 def member_mention_ids(source: SourceConfig, author: str) -> tuple[int, ...]:
@@ -183,6 +199,16 @@ class Config:
     enable_subscription_gui: bool
     enable_text_subscription_commands: bool
     pin_subscription_panel: bool
+    enable_toyoko_watcher: bool
+    toyoko_channel_id: int
+    toyoko_db: Path
+    toyoko_default_min_interval_seconds: int
+    toyoko_default_max_interval_seconds: int
+    toyoko_min_allowed_interval_seconds: int
+    toyoko_request_gap_seconds: int
+    toyoko_rule_gap_seconds: int
+    toyoko_max_rules_per_user: int
+    pin_toyoko_panel: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -190,8 +216,10 @@ class Config:
         if not token or token == "請填入Bot_Token":
             raise ValueError("請在 .env 設定 DISCORD_BOT_TOKEN")
 
-        def channel_id(name: str) -> int:
+        def channel_id(name: str, *, required: bool = True) -> int:
             raw = os.getenv(name, "").strip()
+            if not required and (not raw or raw == "0"):
+                return 0
             if not raw.isdigit():
                 raise ValueError(f"請在 .env 設定數字格式的 {name}")
             return int(raw)
@@ -201,11 +229,15 @@ class Config:
             return path if path.is_absolute() else ROOT / path
 
         interval = _positive_int("HINATA_CHECK_INTERVAL_SECONDS", 15)
+        hinata_enabled = _boolean("HINATA_ENABLE_WATCHER", True)
+        sakura_enabled = _boolean("SAKURA_ENABLE_WATCHER", True)
         sources = (
             SourceConfig(
                 key="hinata",
                 name="日向坂46",
-                channel_id=channel_id("HINATA_DISCORD_CHANNEL_ID"),
+                channel_id=channel_id(
+                    "HINATA_DISCORD_CHANNEL_ID", required=hinata_enabled
+                ),
                 index_url=HINATA_INDEX_URL,
                 detail_url=HINATA_DETAIL_URL,
                 member_index_url=HINATA_MEMBER_INDEX_URL,
@@ -215,11 +247,14 @@ class Config:
                 state_db=local_path("HINATA_STATE_DB", "data/watcher.db"),
                 image_dir=local_path("HINATA_IMAGE_DIR", "images/日向坂46"),
                 member_mentions=_member_mentions("HINATA_MEMBER_MENTIONS"),
+                enabled=hinata_enabled,
             ),
             SourceConfig(
                 key="sakura",
                 name="櫻坂46",
-                channel_id=channel_id("SAKURA_DISCORD_CHANNEL_ID"),
+                channel_id=channel_id(
+                    "SAKURA_DISCORD_CHANNEL_ID", required=sakura_enabled
+                ),
                 index_url=SAKURA_INDEX_URL,
                 detail_url=SAKURA_DETAIL_URL,
                 member_index_url=SAKURA_MEMBER_INDEX_URL,
@@ -229,8 +264,40 @@ class Config:
                 state_db=local_path("SAKURA_STATE_DB", "data/sakura_watcher.db"),
                 image_dir=local_path("SAKURA_IMAGE_DIR", "images/櫻坂46"),
                 member_mentions=_member_mentions("SAKURA_MEMBER_MENTIONS"),
+                enabled=sakura_enabled,
             ),
         )
+        enable_toyoko_watcher = _boolean("ENABLE_TOYOKO_WATCHER", False)
+        toyoko_channel_id = _optional_channel_id("TOYOKO_CHANNEL_ID")
+        if enable_toyoko_watcher and not toyoko_channel_id:
+            raise ValueError(
+                "ENABLE_TOYOKO_WATCHER=true 時必須設定 TOYOKO_CHANNEL_ID"
+            )
+        toyoko_default_min_interval_seconds = _positive_int(
+            "TOYOKO_DEFAULT_MIN_INTERVAL_SECONDS", 600
+        )
+        toyoko_default_max_interval_seconds = _positive_int(
+            "TOYOKO_DEFAULT_MAX_INTERVAL_SECONDS", 900
+        )
+        if (
+            toyoko_default_max_interval_seconds
+            < toyoko_default_min_interval_seconds
+        ):
+            raise ValueError(
+                "TOYOKO_DEFAULT_MAX_INTERVAL_SECONDS 不得小於 "
+                "TOYOKO_DEFAULT_MIN_INTERVAL_SECONDS"
+            )
+        toyoko_min_allowed_interval_seconds = _positive_int(
+            "TOYOKO_MIN_ALLOWED_INTERVAL_SECONDS", 600
+        )
+        if (
+            toyoko_default_min_interval_seconds
+            < toyoko_min_allowed_interval_seconds
+        ):
+            raise ValueError(
+                "TOYOKO_DEFAULT_MIN_INTERVAL_SECONDS 不得小於 "
+                "TOYOKO_MIN_ALLOWED_INTERVAL_SECONDS"
+            )
         return cls(
             token=token,
             sources=sources,
@@ -252,6 +319,28 @@ class Config:
                 "ENABLE_TEXT_SUBSCRIPTION_COMMANDS", True
             ),
             pin_subscription_panel=_boolean("PIN_SUBSCRIPTION_PANEL", True),
+            enable_toyoko_watcher=enable_toyoko_watcher,
+            toyoko_channel_id=toyoko_channel_id,
+            toyoko_db=local_path("TOYOKO_DB", "data/toyoko_watcher.db"),
+            toyoko_default_min_interval_seconds=(
+                toyoko_default_min_interval_seconds
+            ),
+            toyoko_default_max_interval_seconds=(
+                toyoko_default_max_interval_seconds
+            ),
+            toyoko_min_allowed_interval_seconds=(
+                toyoko_min_allowed_interval_seconds
+            ),
+            toyoko_request_gap_seconds=_positive_int(
+                "TOYOKO_REQUEST_GAP_SECONDS", 3
+            ),
+            toyoko_rule_gap_seconds=_positive_int(
+                "TOYOKO_RULE_GAP_SECONDS", 30
+            ),
+            toyoko_max_rules_per_user=_positive_int(
+                "TOYOKO_MAX_RULES_PER_USER", 5
+            ),
+            pin_toyoko_panel=_boolean("PIN_TOYOKO_PANEL", True),
         )
 
 
@@ -294,12 +383,47 @@ def _unique_catalog_members(catalog: dict[str, str]) -> tuple[tuple[str, str], .
     return tuple(members)
 
 
-class SubscriptionPanelView(discord.ui.View):
+class SubscriptionView(discord.ui.View):
+    """Common error handling for every subscription interaction."""
+
+    def __init__(
+        self, watcher: "MultiBlogWatcher", *, timeout: float | None
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.watcher = watcher
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        self.watcher.log.error(
+            "Subscription interaction failed for custom_id=%s user=%s guild=%s",
+            getattr(item, "custom_id", None),
+            interaction.user.id,
+            interaction.guild_id,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        error_message = "POKA 處理關注操作時發生錯誤，請重新開啟關注管理面板再試一次。"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(error_message, ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    error_message, ephemeral=True
+                )
+        except discord.HTTPException:
+            self.watcher.log.exception(
+                "Unable to send subscription interaction error response"
+            )
+
+
+class SubscriptionPanelView(SubscriptionView):
     """Persistent public entry point; the actual manager is always ephemeral."""
 
     def __init__(self, watcher: "MultiBlogWatcher") -> None:
-        super().__init__(timeout=None)
-        self.watcher = watcher
+        super().__init__(watcher, timeout=None)
 
     @discord.ui.button(
         label="管理我的關注",
@@ -324,12 +448,11 @@ class SubscriptionPanelView(discord.ui.View):
         await self.watcher.show_current_subscriptions(interaction)
 
 
-class SubscriptionGroupView(discord.ui.View):
+class SubscriptionGroupView(SubscriptionView):
     """Stateless persistent selector so an idle private menu remains usable."""
 
     def __init__(self, watcher: "MultiBlogWatcher") -> None:
-        super().__init__(timeout=None)
-        self.watcher = watcher
+        super().__init__(watcher, timeout=None)
 
     async def _open_group(
         self, interaction: discord.Interaction, group_key: str
@@ -427,10 +550,11 @@ class MemberSubscriptionSelect(discord.ui.Select):
         return member_name[:100]
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
         await self.manager.replace_page(interaction, set(self.values))
 
 
-class MemberSubscriptionView(discord.ui.View):
+class MemberSubscriptionView(SubscriptionView):
     def __init__(
         self,
         watcher: "MultiBlogWatcher",
@@ -442,10 +566,9 @@ class MemberSubscriptionView(discord.ui.View):
         page: int,
         stale_keys: set[str] | None = None,
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(watcher, timeout=None)
         if guild_id is None:
             raise ValueError("Subscription GUI requires a Discord server")
-        self.watcher = watcher
         self.guild_id = guild_id
         self.user_id = user_id
         self.source = source
@@ -520,7 +643,7 @@ class MemberSubscriptionView(discord.ui.View):
             selected_keys,
         )
         view = self.refreshed()
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=view.render_content("✅ 這一頁的關注設定已儲存。"), view=view
         )
 
@@ -530,8 +653,11 @@ class MemberSubscriptionView(discord.ui.View):
     async def previous_page(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
+        await interaction.response.defer()
         view = self.refreshed(page=self.page - 1)
-        await interaction.response.edit_message(content=view.render_content(), view=view)
+        await interaction.edit_original_response(
+            content=view.render_content(), view=view
+        )
 
     @discord.ui.button(
         label="下一頁", emoji="➡️", style=discord.ButtonStyle.secondary, row=1
@@ -539,8 +665,11 @@ class MemberSubscriptionView(discord.ui.View):
     async def next_page(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
+        await interaction.response.defer()
         view = self.refreshed(page=self.page + 1)
-        await interaction.response.edit_message(content=view.render_content(), view=view)
+        await interaction.edit_original_response(
+            content=view.render_content(), view=view
+        )
 
     @discord.ui.button(
         label="清除此頁", emoji="🗑️", style=discord.ButtonStyle.danger, row=1
@@ -548,7 +677,8 @@ class MemberSubscriptionView(discord.ui.View):
     async def clear_page(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
-        await interaction.response.edit_message(
+        await interaction.response.defer()
+        await interaction.edit_original_response(
             content=(
                 f"確定要取消{self.source.name}第 {self.page + 1} 頁的所有關注嗎？"
                 "其他頁與另一團不會受影響。"
@@ -562,15 +692,16 @@ class MemberSubscriptionView(discord.ui.View):
     async def back(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
-        await interaction.response.edit_message(
+        await interaction.response.defer()
+        await interaction.edit_original_response(
             content="請選擇要管理的團體：",
             view=SubscriptionGroupView(self.watcher),
         )
 
 
-class ClearPageConfirmationView(discord.ui.View):
+class ClearPageConfirmationView(SubscriptionView):
     def __init__(self, manager: MemberSubscriptionView) -> None:
-        super().__init__(timeout=120)
+        super().__init__(manager.watcher, timeout=None)
         self.manager = manager
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -580,15 +711,521 @@ class ClearPageConfirmationView(discord.ui.View):
     async def confirm(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
+        await interaction.response.defer()
         await self.manager.replace_page(interaction, set())
 
     @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
     async def cancel(
         self, interaction: discord.Interaction, _: discord.ui.Button
     ) -> None:
+        await interaction.response.defer()
         view = self.manager.refreshed()
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=view.render_content("已取消清除。"), view=view
+        )
+
+
+TOYOKO_PANEL_CONTENT = (
+    "## 🏨 東橫 INN 空房監視器\n"
+    "建立個人空房監看後，POKA 會以低頻率依序查詢。發現空房時會優先私訊你；"
+    "無法私訊時才會在這個頻道標記你。設定畫面只有操作的人看得到。"
+)
+
+
+class ToyokoView(discord.ui.View):
+    def __init__(
+        self,
+        watcher: "MultiBlogWatcher",
+        *,
+        timeout: float | None,
+        owner_id: int | None = None,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.watcher = watcher
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id is None or interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "請從公開面板開啟你自己的東橫監看管理畫面。", ephemeral=True
+        )
+        return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        self.watcher.log.error(
+            "Toyoko interaction failed for custom_id=%s user=%s guild=%s",
+            getattr(item, "custom_id", None),
+            interaction.user.id,
+            interaction.guild_id,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        message = "POKA 處理東橫監看設定時發生錯誤，請從公開面板重新開啟後再試。"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            self.watcher.log.exception("Unable to reply to Toyoko interaction error")
+
+
+class ToyokoPanelView(ToyokoView):
+    def __init__(self, watcher: "MultiBlogWatcher") -> None:
+        super().__init__(watcher, timeout=None)
+
+    @discord.ui.button(
+        label="新增監看",
+        emoji="➕",
+        style=discord.ButtonStyle.primary,
+        custom_id="toyoko:add-rule:v1",
+    )
+    async def add_rule(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self.watcher.open_toyoko_create(interaction)
+
+    @discord.ui.button(
+        label="我的監看",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="toyoko:manage-rules:v1",
+    )
+    async def manage_rules(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await self.watcher.open_toyoko_manager(interaction)
+
+
+class ToyokoCreateMethodView(ToyokoView):
+    def __init__(self, watcher: "MultiBlogWatcher", owner_id: int) -> None:
+        super().__init__(watcher, timeout=900, owner_id=owner_id)
+
+    @discord.ui.button(
+        label="貼上搜尋網址",
+        emoji="🔗",
+        style=discord.ButtonStyle.primary,
+    )
+    async def paste_url(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(
+            ToyokoURLModal(self.watcher, interaction.user.id)
+        )
+
+    @discord.ui.button(
+        label="引導式設定",
+        emoji="🗾",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def guided(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer()
+        await interaction.edit_original_response(
+            content="請先選擇日本地區：",
+            view=ToyokoRegionView(self.watcher, interaction.user.id),
+        )
+
+
+class ToyokoModal(discord.ui.Modal):
+    def __init__(
+        self,
+        watcher: "MultiBlogWatcher",
+        *,
+        title: str,
+        owner_id: int,
+    ) -> None:
+        super().__init__(title=title, timeout=900)
+        self.watcher = watcher
+        self.owner_id = owner_id
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        self.watcher.log.error(
+            "Toyoko modal failed for user=%s guild=%s",
+            interaction.user.id,
+            interaction.guild_id,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        message = "POKA 無法儲存這個監看條件，請檢查內容後再試。"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            self.watcher.log.exception("Unable to reply to Toyoko modal error")
+
+    async def save_url(
+        self,
+        interaction: discord.Interaction,
+        search_url: str,
+        interval_text: str,
+    ) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "請從公開面板重新建立自己的監看。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            rule, created = await self.watcher.create_toyoko_rule(
+                interaction, search_url, interval_text
+            )
+        except (ValueError, RuntimeError) as error:
+            await interaction.edit_original_response(content=f"⚠️ {error}")
+            return
+        action = "已建立" if created else "已存在"
+        await interaction.edit_original_response(
+            content=(
+                f"✅ 監看規則{action}\n"
+                f"{self.watcher.render_toyoko_rule(rule)}\n\n"
+                "POKA 已安排檢查；若目前有房，第一次查詢後就會通知你。"
+            )
+        )
+
+
+class ToyokoURLModal(ToyokoModal):
+    search_url = discord.ui.TextInput(
+        label="東橫 INN 搜尋結果網址",
+        placeholder="https://www.toyoko-inn.com/china/search/result/?...",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+    )
+    interval = discord.ui.TextInput(
+        label="檢查頻率（分鐘範圍）",
+        placeholder="例如 10-15",
+        default="10-15",
+        max_length=20,
+    )
+
+    def __init__(self, watcher: "MultiBlogWatcher", owner_id: int) -> None:
+        super().__init__(watcher, title="從搜尋網址建立監看", owner_id=owner_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.save_url(interaction, str(self.search_url), str(self.interval))
+
+
+class ToyokoRegionSelect(discord.ui.Select):
+    def __init__(self, manager: "ToyokoRegionView") -> None:
+        self.manager = manager
+        super().__init__(
+            placeholder="選擇地區",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=region, value=region)
+                for region in JAPAN_PREFECTURE_REGIONS
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        region = self.values[0]
+        await interaction.edit_original_response(
+            content=f"已選擇 **{region}**，請選擇都道府縣：",
+            view=ToyokoPrefectureView(
+                self.manager.watcher, self.manager.owner_id, region
+            ),
+        )
+
+
+class ToyokoRegionView(ToyokoView):
+    def __init__(self, watcher: "MultiBlogWatcher", owner_id: int) -> None:
+        super().__init__(watcher, timeout=900, owner_id=owner_id)
+        self.add_item(ToyokoRegionSelect(self))
+
+
+class ToyokoPrefectureSelect(discord.ui.Select):
+    def __init__(self, manager: "ToyokoPrefectureView") -> None:
+        self.manager = manager
+        super().__init__(
+            placeholder="選擇都道府縣",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=name, value=str(prefecture_id))
+                for prefecture_id, name in JAPAN_PREFECTURE_REGIONS[
+                    manager.region
+                ]
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        prefecture_id = int(self.values[0])
+        prefecture_name = next(
+            name
+            for value, name in JAPAN_PREFECTURE_REGIONS[self.manager.region]
+            if value == prefecture_id
+        )
+        await interaction.edit_original_response(
+            content=(
+                f"已選擇 **{prefecture_name}**。接著選擇吸菸條件；"
+                "點選後會開啟日期、人數與頻率表單。"
+            ),
+            view=ToyokoSmokingView(
+                self.manager.watcher,
+                self.manager.owner_id,
+                prefecture_id,
+                prefecture_name,
+            ),
+        )
+
+
+class ToyokoPrefectureView(ToyokoView):
+    def __init__(
+        self, watcher: "MultiBlogWatcher", owner_id: int, region: str
+    ) -> None:
+        super().__init__(watcher, timeout=900, owner_id=owner_id)
+        self.region = region
+        self.add_item(ToyokoPrefectureSelect(self))
+
+
+class ToyokoSmokingSelect(discord.ui.Select):
+    def __init__(self, manager: "ToyokoSmokingView") -> None:
+        self.manager = manager
+        super().__init__(
+            placeholder="選擇禁菸／吸菸條件",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=label, value=value)
+                for value, label in SMOKING_LABELS.items()
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(
+            ToyokoGuidedModal(
+                self.manager.watcher,
+                interaction.user.id,
+                self.manager.prefecture_id,
+                self.manager.prefecture_name,
+                self.values[0],
+            )
+        )
+
+
+class ToyokoSmokingView(ToyokoView):
+    def __init__(
+        self,
+        watcher: "MultiBlogWatcher",
+        owner_id: int,
+        prefecture_id: int,
+        prefecture_name: str,
+    ) -> None:
+        super().__init__(watcher, timeout=900, owner_id=owner_id)
+        self.prefecture_id = prefecture_id
+        self.prefecture_name = prefecture_name
+        self.add_item(ToyokoSmokingSelect(self))
+
+
+class ToyokoGuidedModal(ToyokoModal):
+    check_in = discord.ui.TextInput(
+        label="入住日期", placeholder="2026-11-21", max_length=10
+    )
+    check_out = discord.ui.TextInput(
+        label="退房日期", placeholder="2026-11-23", max_length=10
+    )
+    people_and_rooms = discord.ui.TextInput(
+        label="人數,房間數", placeholder="例如 1,1", default="1,1", max_length=20
+    )
+    interval = discord.ui.TextInput(
+        label="檢查頻率（分鐘範圍）",
+        placeholder="例如 10-15",
+        default="10-15",
+        max_length=20,
+    )
+
+    def __init__(
+        self,
+        watcher: "MultiBlogWatcher",
+        owner_id: int,
+        prefecture_id: int,
+        prefecture_name: str,
+        smoking: str,
+    ) -> None:
+        super().__init__(
+            watcher,
+            title=f"設定{prefecture_name}空房監看",
+            owner_id=owner_id,
+        )
+        self.prefecture_id = prefecture_id
+        self.smoking = smoking
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        parts = re.split(r"[,，、/\s]+", str(self.people_and_rooms).strip())
+        if len(parts) != 2:
+            await interaction.response.send_message(
+                "人數與房間數請填寫成 `1,1`。", ephemeral=True
+            )
+            return
+        try:
+            query = build_toyoko_search_url(
+                scope_type="prefecture",
+                scope_id=self.prefecture_id,
+                check_in=str(self.check_in),
+                check_out=str(self.check_out),
+                people=parts[0],
+                rooms=parts[1],
+                smoking=self.smoking,
+            )
+        except ValueError as error:
+            await interaction.response.send_message(f"⚠️ {error}", ephemeral=True)
+            return
+        await self.save_url(interaction, query.search_url, str(self.interval))
+
+
+class ToyokoRuleSelect(discord.ui.Select):
+    def __init__(self, manager: "ToyokoManageView") -> None:
+        self.manager = manager
+        options: list[discord.SelectOption] = []
+        for rule in manager.rules:
+            label = f"#{rule.rule_id} {rule.destination}"[:100]
+            description = (
+                f"{rule.check_in:%Y/%m/%d}–{rule.check_out:%m/%d} · "
+                f"{'啟用' if rule.enabled else '暫停'}"
+            )[:100]
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=description,
+                    value=str(rule.rule_id),
+                    default=rule.rule_id == manager.selected_rule_id,
+                )
+            )
+        super().__init__(
+            placeholder="選擇要管理的規則",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        view = self.manager.refreshed(selected_rule_id=int(self.values[0]))
+        await interaction.edit_original_response(content=view.render(), view=view)
+
+
+class ToyokoManageView(ToyokoView):
+    def __init__(
+        self,
+        watcher: "MultiBlogWatcher",
+        guild_id: int,
+        owner_id: int,
+        rules: tuple[ToyokoRule, ...],
+        selected_rule_id: int | None = None,
+    ) -> None:
+        super().__init__(watcher, timeout=900, owner_id=owner_id)
+        self.guild_id = guild_id
+        self.rules = rules
+        rule_ids = {rule.rule_id for rule in rules}
+        self.selected_rule_id = (
+            selected_rule_id
+            if selected_rule_id in rule_ids
+            else (rules[0].rule_id if rules else None)
+        )
+        if rules:
+            self.add_item(ToyokoRuleSelect(self))
+
+    @property
+    def selected_rule(self) -> ToyokoRule | None:
+        return next(
+            (
+                rule
+                for rule in self.rules
+                if rule.rule_id == self.selected_rule_id
+            ),
+            None,
+        )
+
+    def render(self, notice: str | None = None) -> str:
+        if not self.rules:
+            return "你目前沒有東橫 INN 空房監看。"
+        selected = self.selected_rule
+        lines = ["## 我的東橫空房監看"]
+        if notice:
+            lines.append(notice)
+        if selected is not None:
+            lines.extend(("", self.watcher.render_toyoko_rule(selected)))
+        return "\n".join(lines)
+
+    def refreshed(
+        self, *, selected_rule_id: int | None = None
+    ) -> "ToyokoManageView":
+        store = self.watcher.require_toyoko_store()
+        return ToyokoManageView(
+            self.watcher,
+            self.guild_id,
+            self.owner_id or 0,
+            store.user_rules(self.guild_id, self.owner_id or 0),
+            selected_rule_id=(
+                self.selected_rule_id
+                if selected_rule_id is None
+                else selected_rule_id
+            ),
+        )
+
+    @discord.ui.button(label="暫停／恢復", emoji="⏯️", row=1)
+    async def toggle(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer()
+        rule = self.selected_rule
+        if rule is None:
+            return
+        self.watcher.require_toyoko_store().set_enabled(
+            rule.rule_id, interaction.user.id, not rule.enabled
+        )
+        view = self.refreshed(selected_rule_id=rule.rule_id)
+        await interaction.edit_original_response(
+            content=view.render("✅ 規則狀態已更新。"), view=view
+        )
+
+    @discord.ui.button(label="安排立即檢查", emoji="🔄", row=1)
+    async def check_now(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer()
+        rule = self.selected_rule
+        if rule is None:
+            return
+        self.watcher.require_toyoko_store().schedule_now(
+            rule.rule_id,
+            interaction.user.id,
+            time.time(),
+        )
+        view = self.refreshed(selected_rule_id=rule.rule_id)
+        await interaction.edit_original_response(
+            content=view.render("✅ 已加入查詢佇列，不會跳過全域請求間隔。"),
+            view=view,
+        )
+
+    @discord.ui.button(
+        label="刪除", emoji="🗑️", style=discord.ButtonStyle.danger, row=1
+    )
+    async def delete(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer()
+        rule = self.selected_rule
+        if rule is None:
+            return
+        self.watcher.require_toyoko_store().delete_rule(
+            rule.rule_id, interaction.user.id
+        )
+        view = self.refreshed()
+        await interaction.edit_original_response(
+            content=view.render("✅ 監看規則已刪除。"),
+            view=view if view.rules else None,
         )
 
 
@@ -609,27 +1246,47 @@ class MultiBlogWatcher(discord.Client):
         self.states = {
             source.key: StateStore(source.state_db)
             for source in config.sources
+            if source.enabled
         }
         self.subscriptions = SubscriptionStore(config.subscription_db)
-        self.reactivated_posts = self.states["sakura"].enable_previously_ignored_posts()
+        sakura_state = self.states.get("sakura")
+        self.reactivated_posts = (
+            sakura_state.enable_previously_ignored_posts()
+            if sakura_state is not None
+            else 0
+        )
+        self.toyoko_store = (
+            ToyokoStore(config.toyoko_db) if config.enable_toyoko_watcher else None
+        )
+        self.toyoko_client: ToyokoClient | None = None
         self.http_session: aiohttp.ClientSession | None = None
         self.workers: dict[str, asyncio.Task[None]] = {}
         self.member_catalogs: dict[str, dict[str, str]] = {}
         self.member_catalog_fetched_at: dict[str, float] = {}
         self.member_catalog_lock = asyncio.Lock()
         self.subscription_panel_lock = asyncio.Lock()
+        self.toyoko_panel_lock = asyncio.Lock()
         self.log = logging.getLogger("watcher")
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession(
             headers={"User-Agent": self.config.user_agent}
         )
+        if self.config.enable_toyoko_watcher:
+            self.toyoko_client = ToyokoClient(
+                self.http_session,
+                self.config.timeout,
+                self.config.retries,
+                self.config.toyoko_request_gap_seconds,
+            )
         if (
             self.config.subscription_channel_id
             and self.config.enable_subscription_gui
         ):
             self.add_view(SubscriptionPanelView(self))
             self.add_view(SubscriptionGroupView(self))
+        if self.config.enable_toyoko_watcher and self.config.toyoko_channel_id:
+            self.add_view(ToyokoPanelView(self))
 
     async def on_ready(self) -> None:
         self.log.info("Discord connected as %s", self.user)
@@ -659,7 +1316,24 @@ class MultiBlogWatcher(discord.Client):
                 ),
                 self.config.subscription_channel_id,
             )
+        if self.config.enable_toyoko_watcher:
+            try:
+                await self.ensure_toyoko_panel()
+            except Exception:
+                self.log.exception("Unable to create or restore Toyoko panel")
+            worker = self.workers.get("toyoko")
+            if worker is None or worker.done():
+                self.workers["toyoko"] = asyncio.create_task(
+                    self.watch_toyoko_forever(), name="toyoko-watcher"
+                )
+            self.log.info(
+                "Toyoko watcher enabled in Discord channel %s",
+                self.config.toyoko_channel_id,
+            )
         for source in self.config.sources:
+            if not source.enabled:
+                self.log.info("%s watcher disabled by configuration", source.name)
+                continue
             self.log.info(
                 "%s watcher targets Discord channel %s",
                 source.name,
@@ -713,6 +1387,329 @@ class MultiBlogWatcher(discord.Client):
             (source for source in self.config.sources if source.key == group_key),
             None,
         )
+
+    def require_toyoko_store(self) -> ToyokoStore:
+        if self.toyoko_store is None:
+            raise RuntimeError("東橫監視器目前未啟用")
+        return self.toyoko_store
+
+    def require_toyoko_client(self) -> ToyokoClient:
+        if self.toyoko_client is None:
+            raise RuntimeError("東橫監視器的 HTTP client 尚未準備完成")
+        return self.toyoko_client
+
+    def _toyoko_panel_setting_key(self) -> str:
+        return f"toyoko_panel_message_id:{self.config.toyoko_channel_id}"
+
+    async def pin_toyoko_panel(self, panel_message: discord.Message) -> None:
+        if not self.config.pin_toyoko_panel or panel_message.pinned:
+            return
+        try:
+            await panel_message.pin(reason="Keep the Toyoko watch panel available")
+        except discord.Forbidden:
+            self.log.warning(
+                "Unable to pin Toyoko panel; grant Manage Messages in channel %s",
+                self.config.toyoko_channel_id,
+            )
+        except discord.HTTPException:
+            self.log.exception("Discord failed to pin Toyoko panel")
+
+    async def ensure_toyoko_panel(self) -> None:
+        async with self.toyoko_panel_lock:
+            if (
+                not self.config.enable_toyoko_watcher
+                or not self.config.toyoko_channel_id
+            ):
+                return
+            store = self.require_toyoko_store()
+            channel = self.get_channel(self.config.toyoko_channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(self.config.toyoko_channel_id)
+            if not hasattr(channel, "send") or not hasattr(channel, "fetch_message"):
+                raise RuntimeError("東橫監視頻道不是可傳送及讀取訊息的頻道")
+
+            setting_key = self._toyoko_panel_setting_key()
+            stored_id = store.get_setting(setting_key)
+            if stored_id and stored_id.isdigit():
+                try:
+                    panel_message = await channel.fetch_message(int(stored_id))
+                    if self.user is not None and panel_message.author.id == self.user.id:
+                        await panel_message.edit(
+                            content=TOYOKO_PANEL_CONTENT,
+                            view=ToyokoPanelView(self),
+                        )
+                        await self.pin_toyoko_panel(panel_message)
+                        self.log.info(
+                            "Toyoko panel restored from message %s", panel_message.id
+                        )
+                        return
+                except discord.NotFound:
+                    self.log.info("Stored Toyoko panel was deleted; replacing it")
+                store.delete_setting(setting_key)
+            elif stored_id:
+                store.delete_setting(setting_key)
+
+            panel_message = await channel.send(
+                TOYOKO_PANEL_CONTENT,
+                view=ToyokoPanelView(self),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            store.set_setting(setting_key, str(panel_message.id))
+            await self.pin_toyoko_panel(panel_message)
+            self.log.info(
+                "Toyoko panel created as message %s in channel %s",
+                panel_message.id,
+                self.config.toyoko_channel_id,
+            )
+
+    async def open_toyoko_create(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "東橫監看只能在 Discord 伺服器內設定。", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "選擇建立方式。精確地區或指定飯店建議使用東橫官方搜尋網址；"
+            "引導式設定目前支援日本都道府縣。",
+            view=ToyokoCreateMethodView(self, interaction.user.id),
+            ephemeral=True,
+        )
+
+    async def open_toyoko_manager(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "東橫監看只能在 Discord 伺服器內管理。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        rules = self.require_toyoko_store().user_rules(
+            interaction.guild_id, interaction.user.id
+        )
+        view = ToyokoManageView(
+            self,
+            interaction.guild_id,
+            interaction.user.id,
+            rules,
+        )
+        await interaction.edit_original_response(
+            content=view.render(), view=view if rules else None
+        )
+
+    async def create_toyoko_rule(
+        self,
+        interaction: discord.Interaction,
+        search_url: str,
+        interval_text: str,
+    ) -> tuple[ToyokoRule, bool]:
+        if interaction.guild_id is None:
+            raise ValueError("東橫監看只能在 Discord 伺服器內建立")
+        store = self.require_toyoko_store()
+        query = parse_toyoko_search_url(search_url)
+        existing = next(
+            (
+                rule
+                for rule in store.user_rules(
+                    interaction.guild_id, interaction.user.id
+                )
+                if rule.search_url == query.search_url
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing, False
+        if (
+            store.count_user_rules(interaction.guild_id, interaction.user.id)
+            >= self.config.toyoko_max_rules_per_user
+        ):
+            raise ValueError(
+                f"每位使用者最多建立 {self.config.toyoko_max_rules_per_user} 條監看"
+            )
+        interval_min, interval_max = parse_interval_minutes(
+            interval_text,
+            default_min_seconds=self.config.toyoko_default_min_interval_seconds,
+            default_max_seconds=self.config.toyoko_default_max_interval_seconds,
+            minimum_seconds=self.config.toyoko_min_allowed_interval_seconds,
+        )
+        try:
+            definition = await self.require_toyoko_client().fetch_definition(query)
+        except ToyokoHTTPError as error:
+            raise RuntimeError(str(error)) from error
+        except Exception as error:
+            self.log.exception("Unable to validate Toyoko search URL")
+            raise RuntimeError("目前無法讀取這個東橫搜尋結果，請稍後再試") from error
+        rule, created = store.add_rule(
+            guild_id=interaction.guild_id,
+            user_id=interaction.user.id,
+            channel_id=self.config.toyoko_channel_id,
+            definition=definition,
+            interval_min_seconds=interval_min,
+            interval_max_seconds=interval_max,
+            now=time.time(),
+        )
+        if created:
+            self.log.info(
+                "Toyoko rule %s created by user %s for %s",
+                rule.rule_id,
+                rule.user_id,
+                rule.destination,
+            )
+        return rule, created
+
+    @staticmethod
+    def render_toyoko_rule(rule: ToyokoRule) -> str:
+        status_labels = {
+            "available": "有空房",
+            "unavailable": "目前無空房",
+            None: "等待第一次檢查",
+        }
+        interval = (
+            f"{rule.interval_min_seconds // 60}–"
+            f"{rule.interval_max_seconds // 60} 分鐘"
+        )
+        return (
+            f"**#{rule.rule_id} {rule.destination}** "
+            f"({'啟用' if rule.enabled else '暫停'})\n"
+            f"{rule.check_in:%Y/%m/%d}–{rule.check_out:%Y/%m/%d} "
+            f"({rule.query.nights} 晚) · {rule.people} 人 × {rule.rooms} 間 · "
+            f"{SMOKING_LABELS[rule.smoking]}\n"
+            f"頻率：{interval} · 狀態："
+            f"{status_labels.get(rule.last_status, '查詢異常')}\n"
+            f"<{rule.search_url}>"
+        )
+
+    async def notify_toyoko_available(
+        self, rule: ToyokoRule, result: ToyokoAvailabilityResult
+    ) -> None:
+        available = sorted(
+            result.available_hotels,
+            key=lambda hotel: (
+                hotel.lowest_price if hotel.lowest_price is not None else 10**12,
+                hotel.name,
+            ),
+        )
+        embed = discord.Embed(
+            title="🏨 東橫 INN 發現空房",
+            description=(
+                f"**{rule.destination}**\n"
+                f"{rule.check_in:%Y/%m/%d}–{rule.check_out:%Y/%m/%d} "
+                f"({rule.query.nights} 晚) · {rule.people} 人 × {rule.rooms} 間 · "
+                f"{SMOKING_LABELS[rule.smoking]}\n\n"
+                "空房與價格可能隨時變動，請進入官方網站再次確認。"
+            ),
+            url=rule.search_url,
+            color=0x2E8B57,
+        )
+        for hotel in available[:20]:
+            price = (
+                f"¥ {hotel.lowest_price:,} 起"
+                if hotel.lowest_price is not None
+                else "有空房"
+            )
+            embed.add_field(name=hotel.name[:256], value=price, inline=False)
+        if len(available) > 20:
+            embed.set_footer(text=f"另有 {len(available) - 20} 間，請查看官方頁面")
+
+        try:
+            user = self.get_user(rule.user_id)
+            if user is None:
+                user = await self.fetch_user(rule.user_id)
+            await user.send(embed=embed)
+            self.log.info(
+                "Toyoko availability for rule %s sent by DM to user %s",
+                rule.rule_id,
+                rule.user_id,
+            )
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            self.log.info(
+                "Toyoko DM failed for user %s; falling back to channel %s",
+                rule.user_id,
+                rule.channel_id,
+            )
+
+        channel = self.get_channel(rule.channel_id)
+        if channel is None:
+            channel = await self.fetch_channel(rule.channel_id)
+        if not hasattr(channel, "send"):
+            raise RuntimeError("東橫監視頻道不是可傳送訊息的頻道")
+        await channel.send(
+            content=f"<@{rule.user_id}> 東橫 INN 發現空房：",
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=[discord.Object(id=rule.user_id)],
+                roles=False,
+                replied_user=False,
+            ),
+        )
+
+    async def watch_toyoko_forever(self) -> None:
+        store = self.require_toyoko_store()
+        client = self.require_toyoko_client()
+        while not self.is_closed():
+            try:
+                expired = store.disable_expired(japan_today())
+                if expired:
+                    self.log.info("Toyoko watcher disabled %s expired rule(s)", expired)
+                due_rules = store.due_rules(time.time())
+                grouped: dict[str, list[ToyokoRule]] = {}
+                for rule in due_rules:
+                    grouped.setdefault(rule.search_url, []).append(rule)
+                for group_number, rules in enumerate(grouped.values()):
+                    representative = rules[0]
+                    try:
+                        result = await client.fetch_availability(
+                            representative.query, representative.hotels
+                        )
+                        if result.status == "unknown":
+                            raise RuntimeError("東橫空房資料不完整")
+                        now = time.time()
+                        for rule in rules:
+                            try:
+                                if should_notify_availability(
+                                    rule.last_status, rule.last_available, result
+                                ):
+                                    await self.notify_toyoko_available(rule, result)
+                                store.record_success(rule, result, now=now)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                store.record_failure(rule, now=now)
+                                self.log.exception(
+                                    "Toyoko notification failed for rule %s; "
+                                    "will retry",
+                                    rule.rule_id,
+                                )
+                        self.log.info(
+                            "Toyoko poll %s returned %s for %s rule(s)",
+                            representative.destination,
+                            result.status,
+                            len(rules),
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        retry_after = (
+                            error.retry_after
+                            if isinstance(error, ToyokoHTTPError)
+                            else None
+                        )
+                        now = time.time()
+                        for rule in rules:
+                            store.record_failure(
+                                rule, now=now, retry_after=retry_after
+                            )
+                        self.log.exception(
+                            "Toyoko poll failed for %s; backing off",
+                            representative.destination,
+                        )
+                    if group_number < len(grouped) - 1:
+                        await asyncio.sleep(self.config.toyoko_rule_gap_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.log.exception("Toyoko scheduler failed; retrying")
+            await asyncio.sleep(5)
 
     def _subscription_panel_setting_key(self) -> str:
         return f"subscription_panel_message_id:{self.config.subscription_channel_id}"
@@ -815,6 +1812,7 @@ class MultiBlogWatcher(discord.Client):
                 "關注功能只能在 Discord 伺服器內使用。", ephemeral=True
             )
             return
+        await interaction.response.defer(ephemeral=True, thinking=True)
         rows = self.subscriptions.user_subscriptions(
             interaction.guild_id, interaction.user.id
         )
@@ -826,7 +1824,7 @@ class MultiBlogWatcher(discord.Client):
                 f"- {group_names.get(group_key, group_key)}：{member_name}"
                 for group_key, member_name in rows
             )
-        await interaction.response.send_message(content, ephemeral=True)
+        await interaction.edit_original_response(content=content)
 
     async def get_member_catalog(
         self, source: SourceConfig, *, force: bool = False
@@ -1299,6 +2297,8 @@ class MultiBlogWatcher(discord.Client):
         for state in self.states.values():
             state.close()
         self.subscriptions.close()
+        if self.toyoko_store is not None:
+            self.toyoko_store.close()
         await super().close()
 
 
@@ -1307,7 +2307,8 @@ HinataWatcher = MultiBlogWatcher
 
 
 def main() -> int:
-    load_dotenv(ROOT / ".env")
+    env_file = os.getenv("POKA_ENV_FILE", ".env")
+    load_dotenv(ROOT / env_file)
     setup_logging()
     try:
         config = Config.from_env()

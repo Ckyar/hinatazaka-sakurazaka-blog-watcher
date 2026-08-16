@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import discord
 
 from app import (
+    ClearPageConfirmationView,
     Config,
     HinataWatcher,
     MemberSubscriptionView,
@@ -217,6 +218,35 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.enable_text_subscription_commands)
         self.assertFalse(config.pin_subscription_panel)
 
+    def test_toyoko_watcher_is_opt_in_and_requires_its_channel(self):
+        with patch.dict("os.environ", self._minimum_env(), clear=True):
+            config = Config.from_env()
+        self.assertFalse(config.enable_toyoko_watcher)
+        self.assertEqual(config.toyoko_channel_id, 0)
+
+        environment = self._minimum_env() | {"ENABLE_TOYOKO_WATCHER": "true"}
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "TOYOKO_CHANNEL_ID"):
+                Config.from_env()
+
+    def test_blog_watchers_can_be_disabled_for_isolated_windows_testing(self):
+        environment = {
+            "DISCORD_BOT_TOKEN": "test-token",
+            "HINATA_ENABLE_WATCHER": "false",
+            "SAKURA_ENABLE_WATCHER": "false",
+            "HINATA_DISCORD_CHANNEL_ID": "0",
+            "SAKURA_DISCORD_CHANNEL_ID": "0",
+            "ENABLE_SUBSCRIPTION_GUI": "false",
+            "ENABLE_TEXT_SUBSCRIPTION_COMMANDS": "false",
+            "ENABLE_TOYOKO_WATCHER": "true",
+            "TOYOKO_CHANNEL_ID": "123456789012345680",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            config = Config.from_env()
+        self.assertFalse(config.sources[0].enabled)
+        self.assertFalse(config.sources[1].enabled)
+        self.assertTrue(config.enable_toyoko_watcher)
+
     def test_disabled_storage_does_not_create_image_downloader(self):
         environment = self._minimum_env() | {"SAVE_IMAGES_LOCALLY": "false"}
         with patch.dict("os.environ", environment, clear=True):
@@ -375,6 +405,88 @@ class StateTests(unittest.TestCase):
 
 
 class SubscriptionGuiTests(unittest.TestCase):
+    def test_group_click_acknowledges_before_catalog_fetch(self):
+        environment = ConfigTests._minimum_env()
+        with patch.dict("os.environ", environment, clear=True):
+            source = Config.from_env().sources[0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+
+            async def check_acknowledgement_order():
+                response = SimpleNamespace(defer=AsyncMock())
+
+                async def get_member_catalog(_source):
+                    response.defer.assert_awaited_once()
+                    return {"小坂菜緒": "小坂 菜緒"}
+
+                watcher = SimpleNamespace(
+                    source_for_key=lambda _: source,
+                    get_member_catalog=get_member_catalog,
+                    subscriptions=store,
+                    log=Mock(),
+                )
+                interaction = SimpleNamespace(
+                    response=response,
+                    guild_id=1,
+                    user=SimpleNamespace(id=10),
+                    edit_original_response=AsyncMock(),
+                )
+                view = SubscriptionGroupView(watcher)
+                await view._open_group(interaction, "hinata")
+                response.defer.assert_awaited_once()
+                interaction.edit_original_response.assert_awaited_once()
+                view.stop()
+
+            try:
+                asyncio.run(check_acknowledgement_order())
+            finally:
+                store.close()
+
+    def test_member_selection_acknowledges_before_database_update(self):
+        environment = ConfigTests._minimum_env()
+        with patch.dict("os.environ", environment, clear=True):
+            source = Config.from_env().sources[0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = SubscriptionStore(Path(directory) / "subscriptions.db")
+
+            async def check_acknowledgement_order():
+                watcher = SimpleNamespace(subscriptions=store)
+                view = MemberSubscriptionView(
+                    watcher,
+                    1,
+                    10,
+                    source,
+                    (("小坂菜緒", "小坂 菜緒"),),
+                    page=0,
+                )
+                member_select = next(
+                    item
+                    for item in view.children
+                    if isinstance(item, discord.ui.Select)
+                )
+                member_select._values = ["小坂菜緒"]
+                response = SimpleNamespace(defer=AsyncMock())
+                interaction = SimpleNamespace(
+                    response=response,
+                    edit_original_response=AsyncMock(),
+                )
+
+                def replace_page(*_args, **_kwargs):
+                    response.defer.assert_awaited_once()
+
+                with patch.object(
+                    store, "replace_page_subscriptions", side_effect=replace_page
+                ) as update:
+                    await member_select.callback(interaction)
+                    update.assert_called_once()
+                interaction.edit_original_response.assert_awaited_once()
+                view.stop()
+
+            try:
+                asyncio.run(check_acknowledgement_order())
+            finally:
+                store.close()
+
     def test_panel_creation_is_recorded_and_restored_without_duplication(self):
         environment = ConfigTests._minimum_env() | {
             "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
@@ -455,6 +567,30 @@ class SubscriptionGuiTests(unittest.TestCase):
 
         asyncio.run(build_view())
 
+    def test_subscription_error_handler_always_replies(self):
+        async def handle_error():
+            watcher = SimpleNamespace(log=Mock())
+            view = SubscriptionGroupView(watcher)
+            response = SimpleNamespace(
+                is_done=lambda: False,
+                send_message=AsyncMock(),
+            )
+            interaction = SimpleNamespace(
+                response=response,
+                followup=SimpleNamespace(send=AsyncMock()),
+                user=SimpleNamespace(id=10),
+                guild_id=1,
+            )
+            await view.on_error(
+                interaction,
+                RuntimeError("test failure"),
+                SimpleNamespace(custom_id="test"),
+            )
+            response.send_message.assert_awaited_once()
+            view.stop()
+
+        asyncio.run(handle_error())
+
     def test_panel_is_pinned_when_enabled(self):
         environment = ConfigTests._minimum_env() | {
             "SUBSCRIPTION_CHANNEL_ID": "999999999999999999"
@@ -506,6 +642,7 @@ class SubscriptionGuiTests(unittest.TestCase):
                 self.assertEqual(component_rows[0]["components"][0]["type"], 3)
                 self.assertEqual(len(component_rows[1]["components"]), 4)
                 self.assertTrue(first_select.options[0].default)
+                self.assertIsNone(first.timeout)
                 self.assertTrue(first.previous_page.disabled)
                 self.assertFalse(first.next_page.disabled)
 
@@ -534,8 +671,11 @@ class SubscriptionGuiTests(unittest.TestCase):
                 self.assertTrue(former.default)
                 self.assertFalse(second.previous_page.disabled)
                 self.assertTrue(second.next_page.disabled)
+                confirmation = ClearPageConfirmationView(second)
+                self.assertIsNone(confirmation.timeout)
                 first.stop()
                 second.stop()
+                confirmation.stop()
 
             try:
                 asyncio.run(check_views())

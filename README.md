@@ -1,6 +1,6 @@
-# 日向坂46／櫻坂46 部落格圖片 Discord 通知器
+# POKA：日向坂46／櫻坂46部落格與東橫 INN 空房通知器
 
-在 Windows 或 Raspberry Pi OS 上以同一個 Discord Bot 並行輪詢日向坂46及櫻坂46官方部落格首頁，直接取得實際存在的文章 ID，將兩團的新文章圖片傳送至各自指定頻道。本機圖片儲存可透過 `.env` 開啟或關閉。
+在 Windows 或 Raspberry Pi OS 上以同一個 Discord Bot 並行監看日向坂46及櫻坂46官方部落格，也可選擇啟用個人用的東橫 INN 空房監視器。本機圖片儲存與東橫功能都可透過 `.env` 獨立開啟或關閉。
 
 ## 功能
 
@@ -11,6 +11,8 @@
 - SQLite 保存掃描進度、已公告文章與已傳送圖片；程式重啟後會續跑且不重複傳送。
 - 可在同一伺服器的關注頻道用按鈕與複選選單管理兩團成員；也可保留 `!關注` 等文字指令。該成員發文時只 Tag 同伺服器的訂閱者。
 - 成員名單從兩團官方成員頁讀取並定期更新，輸入姓名時會忽略姓與名之間的空白。
+- 可在獨立頻道用 GUI 建立東橫 INN 空房監看；有房時優先私訊，私訊失敗才在頻道 Tag 規則擁有者。
+- 東橫規則使用隨機時間範圍、單一查詢佇列、相同條件合併與錯誤退避，並且不會自動登入或訂房。
 - HTTP 暫時錯誤會重試，Discord 失敗時保留原編號供下次再試。
 - 記錄檔自動輪替，適合長時間運作。
 
@@ -70,7 +72,7 @@ Bot 啟動後會在指定頻道建立一則「部落格關注管理」面板。�
 - Bot：允許 View Channel、Send Messages、Read Message History、Manage Messages；通知圖片頻道另需 Embed Links。
 - `PIN_SUBSCRIPTION_PANEL=true` 時會自動釘選管理面板，方便從頻道的「釘選訊息」直接開啟。若設為 `false`，便不需要 Manage Messages，也可由管理員手動釘選。
 
-面板訊息 ID 會存進 `SUBSCRIPTION_DB`。Bot 重啟時會恢復並確認釘選；若面板已被刪除，下次啟動會自動建立新的面板。「選擇要管理的團體」使用持久化按鈕，長時間沒有操作後仍可繼續選擇。既有文字指令訂閱與 GUI 使用相同資料庫，會直接顯示為已勾選，不需要轉換資料。
+面板訊息 ID 會存進 `SUBSCRIPTION_DB`。Bot 重啟時會恢復並確認釘選；若面板已被刪除，下次啟動會自動建立新的面板。關注 GUI 不會因閒置而自行逾時，且每次操作都會先立即回應 Discord，再讀取名單或更新資料庫；若後續處理失敗，會顯示私人錯誤訊息並在日誌留下完整原因。Bot 若在使用者已開啟成員選單後重新啟動，仍需從公開面板重新開啟一次。既有文字指令訂閱與 GUI 使用相同資料庫，會直接顯示為已勾選，不需要轉換資料。
 
 若想完全改用 GUI，可在確認運作正常後設定：
 
@@ -97,6 +99,41 @@ ENABLE_TEXT_SUBSCRIPTION_COMMANDS=false
 
 訂閱關係以 `guild_id + Discord 使用者 ID + 團體 + 成員` 保存，因此同一位使用者在不同伺服器的關注清單彼此獨立。重複關注不會新增重複資料，取消不存在的關注也會回覆提示。
 
+## 東橫 INN 空房監視器
+
+這項功能預設關閉，不會建立東橫資料庫，也不會產生任何額外網站請求。先由管理員建立一個私人或唯讀文字頻道，再設定：
+
+```dotenv
+ENABLE_TOYOKO_WATCHER=true
+TOYOKO_CHANNEL_ID=東橫監視頻道ID
+TOYOKO_DB=data/toyoko_watcher.db
+TOYOKO_DEFAULT_MIN_INTERVAL_SECONDS=600
+TOYOKO_DEFAULT_MAX_INTERVAL_SECONDS=900
+TOYOKO_MIN_ALLOWED_INTERVAL_SECONDS=600
+TOYOKO_REQUEST_GAP_SECONDS=3
+TOYOKO_RULE_GAP_SECONDS=30
+TOYOKO_MAX_RULES_PER_USER=5
+PIN_TOYOKO_PANEL=true
+```
+
+重新啟動後，POKA 會建立並釘選「東橫 INN 空房監視器」面板。使用者可選擇：
+
+- **貼上搜尋網址**：先在東橫官方網站選好精確地區、飯店、日期、人數、房間及禁菸條件，再將搜尋結果網址貼入。這是監看城市區域或指定飯店時最精確的方式。
+- **引導式設定**：在 Discord 依序選擇日本地區、都道府縣、吸菸條件，再輸入日期、人數、房間數和頻率。
+- **我的監看**：查看、暫停、恢復、刪除規則，或將規則加入立即查詢佇列。
+
+POKA 將「至少一間飯店明確回傳可訂房及最低價」判斷為有房。若頁面格式改變、回應缺漏、連線失敗或網站拒絕查詢，會視為查詢異常而不是無房，並以 30 分鐘、1 小時、2 小時至最多 6 小時的方式逐步退避。到達入住日的規則會自動停止。
+
+有房通知只在下列情況送出：第一次發現有房、無房轉為有房、新增有房飯店，或既有飯店價格下降。相同結果不會每 10–15 分鐘重複通知。通知優先傳送 Discord 私訊；使用者關閉私訊或 Discord 拒絕傳送時，才會在 `TOYOKO_CHANNEL_ID` 標記該使用者。程式只查詢及通知，不登入帳號、不繞過 CAPTCHA，也不會自動訂房；空房及價格仍應以使用者打開官方網站當下的結果為準。
+
+建議頻道權限：
+
+- `@everyone`：允許 View Channel、Read Message History，拒絕 Send Messages；仍可使用 Bot 按鈕。
+- POKA：允許 View Channel、Send Messages、Embed Links、Read Message History。
+- `PIN_TOYOKO_PANEL=true` 時再授予 Manage Messages；由管理員手動釘選時可不授予。
+
+東橫 GUI 不使用一般訊息內容，因此不需要額外開啟 Message Content Intent。Discord 私訊也不需要新增 OAuth2 scope。
+
 ## 2. Windows 安裝
 
 先安裝 [Python 3.10 以上版本](https://www.python.org/downloads/windows/)，安裝時勾選 **Add Python to PATH**。
@@ -111,6 +148,19 @@ SAVE_IMAGES_LOCALLY=true
 ```
 
 再雙擊 `start.bat`。看到 `Discord connected` 即表示運作中。
+
+### 使用同一個 POKA 做隔離的 Windows 測試
+
+不需要建立第二個 Discord Bot，但 Raspberry Pi 與 Windows 不可同時使用相同 Token 連線。做 Discord 整合測試時：
+
+1. 在 Discord 建立只有你與 POKA 可見的測試頻道。
+2. 將 `.env.test.example` 複製成 `.env.test`，填入正式 Token 與測試頻道 ID。
+3. `.env.test` 已將 `HINATA_ENABLE_WATCHER`、`SAKURA_ENABLE_WATCHER`、關注 GUI 和文字指令全部關閉，只啟用東橫功能，避免 Windows 的空資料庫重新傳送舊文章。
+4. 在 Raspberry Pi 執行 `sudo systemctl stop sakamichi-blog-watcher`。
+5. Windows 雙擊 `start_test.bat`，完成測試後先關閉視窗或按 `Ctrl+C`。
+6. 回到 Raspberry Pi 執行 `sudo systemctl start sakamichi-blog-watcher`。
+
+`.env.test`、`data-test/` 和測試 log 都不會被 Git 追蹤。一般解析及資料庫測試不連線 Discord，因此 Raspberry Pi 不需停止；只有實際啟動 Windows POKA 時才需要停止 Pi 服務。
 
 從舊版升級時，請在每台主機自己的 `.env` 將日向坂設定重新命名；設定值保持不變：
 

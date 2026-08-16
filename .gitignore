@@ -1,9 +1,13 @@
 .env
+.env.*
+!.env.example
+!.env.test.example
 .venv/
 __pycache__/
 .pytest_cache/
 *.pyc
 .DS_Store
 data/
+data-test/
 images/
 logs/
